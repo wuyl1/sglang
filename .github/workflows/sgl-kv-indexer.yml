@@ -1,0 +1,145 @@
+name: SGL KV Indexer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "experimental/sgl-kv-indexer/**"
+      - ".github/workflows/sgl-kv-indexer.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "experimental/sgl-kv-indexer/**"
+      - ".github/workflows/sgl-kv-indexer.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt, clippy, and Redis tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+
+    defaults:
+      run:
+        working-directory: experimental/sgl-kv-indexer
+
+    env:
+      KV_INDEXER_REDIS_URL: redis://127.0.0.1:6379
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-kv-indexer -> target
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --features redis-backend -- -D warnings
+
+      - name: Run Redis-enabled tests
+        run: cargo test --features redis-backend
+
+  redis-cluster:
+    name: Redis Cluster redirects and failover
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: experimental/sgl-kv-indexer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-kv-indexer -> target
+
+      - name: Start six-node Redis Cluster
+        run: |
+          set -euo pipefail
+          docker network create kvidx-cluster
+          for i in 1 2 3 4 5 6; do
+            docker run -d --name "kvidx-c$i" --network kvidx-cluster \
+              --tmpfs /data:rw,size=16m redis:7-alpine \
+              redis-server --port 6379 --cluster-enabled yes \
+              --cluster-config-file /data/nodes.conf \
+              --cluster-node-timeout 1000 --appendonly no \
+              --protected-mode no
+          done
+          docker exec kvidx-c1 redis-cli --cluster create \
+            kvidx-c1:6379 kvidx-c2:6379 kvidx-c3:6379 \
+            kvidx-c4:6379 kvidx-c5:6379 kvidx-c6:6379 \
+            --cluster-replicas 1 --cluster-yes
+          ip1=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kvidx-c1)
+          ip2=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kvidx-c2)
+          ip3=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kvidx-c3)
+          echo "KV_INDEXER_REDIS_CLUSTER_NODES=redis://$ip1:6379,redis://$ip2:6379,redis://$ip3:6379" >> "$GITHUB_ENV"
+
+      - name: Run full Redis Cluster integration suite
+        run: cargo test --features redis-backend --test redis_integration -- --test-threads=1
+
+      - name: Exercise ASK redirect
+        run: |
+          set -euo pipefail
+          slot=$(docker exec kvidx-c1 redis-cli cluster keyslot failover-hash)
+          source_id=$(docker exec kvidx-c1 redis-cli cluster myid)
+          target_id=$(docker exec kvidx-c2 redis-cli cluster myid)
+          docker exec kvidx-c1 redis-cli cluster setslot "$slot" migrating "$target_id"
+          docker exec kvidx-c2 redis-cli cluster setslot "$slot" importing "$source_id"
+          KV_INDEXER_ASK_HASH=failover-hash \
+            cargo test --features redis-backend --test redis_integration \
+              cluster_client_follows_ask_redirect -- --nocapture --test-threads=1
+          docker exec kvidx-c1 redis-cli cluster setslot "$slot" stable
+          docker exec kvidx-c2 redis-cli cluster setslot "$slot" stable
+
+      - name: Exercise master failover on existing client
+        run: |
+          set -euo pipefail
+          cargo test --features redis-backend --test redis_integration --no-run
+          KV_INDEXER_FAILOVER_HASH=failover-hash \
+          KV_INDEXER_FAILOVER_PAUSE_SECS=12 \
+            cargo test --features redis-backend --test redis_integration \
+              cluster_client_recovers_after_master_failover \
+              -- --nocapture --test-threads=1 &
+          test_pid=$!
+          sleep 3
+          docker stop kvidx-c1
+          wait "$test_pid"
+
+      - name: Clean up Redis Cluster
+        if: always()
+        working-directory: .
+        run: |
+          docker rm -f kvidx-c1 kvidx-c2 kvidx-c3 kvidx-c4 kvidx-c5 kvidx-c6 || true
+          docker network rm kvidx-cluster || true
