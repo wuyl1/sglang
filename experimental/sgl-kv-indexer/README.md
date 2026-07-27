@@ -20,6 +20,18 @@ The bridge detects sequence gaps and requests missing batches from SGLang's
 replay endpoint. The indexer uses per-worker sequence gating and incarnation
 fencing so duplicate or delayed batches cannot overwrite newer state.
 
+## Best-effort fault tolerance
+
+The index is advisory routing metadata, not the source of truth. Callers must
+tolerate misses and stale candidates; workers remain authoritative.
+
+- The bridge replays sequence gaps while SGLang still has the missing batches.
+- An unrecoverable gap retires the worker incarnation, drops its placements, and
+  resumes the live stream. This favors bounded recovery and temporary
+  under-reporting over infinite catch-up or unverifiable state.
+- Incarnation checkpointing never blocks startup. If persistence fails, the next
+  restart performs a full resync. There is no periodic full-state reconciliation.
+
 ## Current status and limitations
 
 This crate is experimental.
@@ -31,9 +43,7 @@ This crate is experimental.
 - Deploy one bridge per independent SGLang KV-event stream (for example, per DP
   rank), each with a unique `KV_INDEXER_WORKER_ID`.
 - Configure the replay endpoint in production, and size SGLang's `buffer_steps`
-  to cover the longest expected bridge outage. Recovery is best effort: a gap
-  the buffer can no longer cover retires the worker incarnation, so the indexer
-  drops that worker's placements and the bridge resyncs from the live stream.
+  to cover the longest expected bridge outage.
 - Redis Cluster is supported, but an apply batch spans multiple hash slots and
   is not globally atomic. Per-worker sequence and generation fencing preserve
   replay convergence.
@@ -46,9 +56,8 @@ surprised by them:
 - After an incarnation is retired, the bridge resumes from the live event stream
   rather than replaying the new publisher's earlier history. Blocks that SGLang
   cached before the rotation and never re-reports stay absent from the index
-  until they are evicted and cached again. The index under-reports in that
-  window; it never reports a placement that does not exist, so routing degrades
-  to a cache miss rather than a wrong answer.
+  until they are evicted and cached again, so routing may temporarily miss a
+  reusable prefix.
 - Retired incarnation tokens accumulate as `retired:<token>` fields in each
   worker's meta hash and are never pruned. Growth is one small field per bridge
   restart, so it is slow, but a worker restarted continuously for a long time
