@@ -277,27 +277,37 @@ async fn bridge_recovers_seq_gap_via_replay() {
         );
     }
 
-    // The replay endpoint can only return seq 1 for the 1..3 gap. The bridge
-    // may commit that recovered prefix, but it must not commit live seq 3 past
-    // the still-missing seq 2.
+    // The replay endpoint can only return seq 1 for the 1..3 gap. Recovery is
+    // best effort: the bridge commits the recoverable prefix, then retires the
+    // incarnation so the indexer wipes what can no longer be reconstructed, and
+    // resyncs from the live stream. Advancing past seq 2 under the *same*
+    // incarnation would silently keep stale placements alive.
     publisher
         .send(pub_frame(3, stored_payload(3003, "GPU")))
         .await
         .expect("pub incomplete-gap seq 3");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while seqs.lock().unwrap().len() < 7 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seqs.lock().unwrap().len() < 8 {
         assert!(
             std::time::Instant::now() <= deadline,
-            "timed out waiting for replayed prefix of incomplete gap"
+            "timed out waiting for resync after an unrecoverable gap: {:?}",
+            *seqs.lock().unwrap()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         seqs.lock().unwrap().as_slice(),
-        &[0, 1, 2, 3, 4, 0, 1],
-        "bridge must not advance past an incomplete replay gap"
+        &[0, 1, 2, 3, 4, 0, 1, 3],
+        "bridge must recover the replayable prefix and then resync past an unrecoverable gap"
     );
+    {
+        let incarnations = incarnations.lock().unwrap();
+        assert_ne!(
+            incarnations[7], incarnations[6],
+            "an unrecoverable gap must retire the worker incarnation"
+        );
+    }
 }
 
 #[tokio::test]

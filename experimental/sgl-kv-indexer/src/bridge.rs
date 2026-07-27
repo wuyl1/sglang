@@ -66,14 +66,10 @@ impl BridgeConfig {
         let heartbeat_interval = parse_heartbeat_interval()?;
         let incarnation_path = std::env::var_os("KV_INDEXER_WORKER_INCARNATION_FILE")
             .map(PathBuf::from)
-            .or_else(|| Some(default_incarnation_path(&worker_id)));
+            .unwrap_or_else(|| default_incarnation_path(&worker_id));
         let incarnation_prefix = std::env::var("KV_INDEXER_WORKER_INCARNATION").ok();
-        let incarnation = load_or_create_incarnation(
-            incarnation_path
-                .as_deref()
-                .expect("default incarnation path is always present"),
-            incarnation_prefix.as_deref(),
-        )?;
+        let incarnation =
+            load_or_create_incarnation(&incarnation_path, incarnation_prefix.as_deref());
 
         Ok(Self {
             worker_id,
@@ -85,7 +81,7 @@ impl BridgeConfig {
             clear_tiers,
             heartbeat_interval,
             incarnation,
-            incarnation_path,
+            incarnation_path: Some(incarnation_path),
         })
     }
 }
@@ -106,73 +102,76 @@ fn new_incarnation(prefix: Option<&str>) -> String {
     }
 }
 
-fn load_or_create_incarnation(path: &Path, prefix: Option<&str>) -> Result<String, BridgeError> {
+fn warn_checkpoint(path: &Path, error: &std::io::Error) {
+    warn!(
+        path = %path.display(),
+        %error,
+        "publisher incarnation checkpoint unavailable; a bridge restart will resync from scratch"
+    );
+}
+
+/// Reads the stored token. `None` when the checkpoint is absent, empty (a write
+/// interrupted mid-rotation), or unreadable.
+fn read_incarnation(path: &Path) -> Option<String> {
     match fs::read_to_string(path) {
-        Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_string()),
-        Ok(_) => {
-            return Err(BridgeError::Config(format!(
-                "incarnation file {} is empty",
-                path.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            return Err(BridgeError::Config(format!(
-                "failed to read incarnation file {}: {error}",
-                path.display()
-            )));
+            warn_checkpoint(path, &error);
+            None
         }
+    }
+}
+
+/// Returns the token this bridge lifetime presents to the indexer, minting and
+/// persisting a fresh one when the checkpoint holds nothing usable.
+///
+/// Persistence is best effort: on a read-only or otherwise unusable location the
+/// bridge still starts, it just cannot resume a publisher's sequence across its
+/// own restart and falls back to a full resync.
+fn load_or_create_incarnation(path: &Path, prefix: Option<&str>) -> String {
+    if let Some(stored) = read_incarnation(path) {
+        return stored;
     }
 
     let incarnation = new_incarnation(prefix);
     match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => file
-            .write_all(incarnation.as_bytes())
-            .map_err(|error| {
-                BridgeError::Config(format!(
-                    "failed to write incarnation file {}: {error}",
-                    path.display()
-                ))
-            })
-            .map(|()| incarnation),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => fs::read_to_string(path)
-            .map_err(|error| {
-                BridgeError::Config(format!(
-                    "failed to read concurrently-created incarnation file {}: {error}",
-                    path.display()
-                ))
-            })
-            .and_then(|value| {
-                let value = value.trim();
-                if value.is_empty() {
-                    Err(BridgeError::Config(format!(
-                        "incarnation file {} is empty",
-                        path.display()
-                    )))
-                } else {
-                    Ok(value.to_string())
-                }
-            }),
-        Err(error) => Err(BridgeError::Config(format!(
-            "failed to create incarnation file {}: {error}",
-            path.display()
-        ))),
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(incarnation.as_bytes()) {
+                warn_checkpoint(path, &error);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Either a concurrently started bridge won the race, in which case
+            // adopting its token keeps a single live incarnation per worker, or
+            // the file is the unusable one we just rejected and gets replaced.
+            if let Some(stored) = read_incarnation(path) {
+                return stored;
+            }
+            if let Err(error) = fs::write(path, &incarnation) {
+                warn_checkpoint(path, &error);
+            }
+        }
+        Err(error) => warn_checkpoint(path, &error),
     }
+    incarnation
 }
 
-fn rotate_incarnation(config: &BridgeConfig, incarnation: &mut String) -> Result<(), BridgeError> {
+/// Retires the current token in favour of a fresh one.
+///
+/// A checkpoint that cannot be updated is removed rather than left stale: the
+/// indexer rejects a retired token with a permanent error, so a later bridge
+/// start must mint a new token instead of replaying this one.
+fn rotate_incarnation(config: &BridgeConfig, incarnation: &mut String) {
     let prefix = std::env::var("KV_INDEXER_WORKER_INCARNATION").ok();
     let next = new_incarnation(prefix.as_deref());
     if let Some(path) = &config.incarnation_path {
-        fs::write(path, &next).map_err(|error| {
-            BridgeError::Config(format!(
-                "failed to rotate incarnation file {}: {error}",
-                path.display()
-            ))
-        })?;
+        if let Err(error) = fs::write(path, &next) {
+            warn_checkpoint(path, &error);
+            let _ = fs::remove_file(path);
+        }
     }
     *incarnation = next;
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -493,14 +492,14 @@ async fn run_session(
                     actual = seq,
                     "SGLang KV event sequence moved backwards; treating publisher as restarted"
                 );
-                rotate_incarnation(config, incarnation)?;
+                rotate_incarnation(config, incarnation);
                 *next_seq = None;
                 *pending_batch = None;
                 send_heartbeat(config, incarnation, &mut client).await?;
             }
             if seq > expected {
                 warn!(expected, actual = seq, "SGLang KV event sequence gap");
-                replay_missing_batches(
+                match replay_missing_batches(
                     config,
                     incarnation,
                     &mut client,
@@ -508,7 +507,29 @@ async fn run_session(
                     seq,
                     pending_batch,
                 )
-                .await?;
+                .await
+                {
+                    Ok(()) => {}
+                    // Gap recovery is best effort. Once the publisher's replay
+                    // buffer no longer covers the gap, no amount of retrying can
+                    // close it, so retire the incarnation to have the indexer
+                    // wipe the state we can no longer reconstruct and resync
+                    // from the live stream. Stalling instead would leave the
+                    // worker unindexed for as long as it runs.
+                    Err(BridgeError::Replay(reason)) => {
+                        warn!(
+                            expected,
+                            actual = seq,
+                            %reason,
+                            "unrecoverable SGLang KV event gap; retiring worker incarnation and resyncing"
+                        );
+                        rotate_incarnation(config, incarnation);
+                        *next_seq = None;
+                        *pending_batch = None;
+                        send_heartbeat(config, incarnation, &mut client).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -1039,6 +1060,67 @@ mod tests {
             incarnation: "test-incarnation".to_string(),
             incarnation_path: None,
         }
+    }
+
+    fn temp_checkpoint(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sgl-kv-indexer-test-{name}-{unique}"))
+    }
+
+    #[test]
+    fn incarnation_checkpoint_is_reused_across_loads() {
+        let path = temp_checkpoint("reuse");
+        let first = load_or_create_incarnation(&path, None);
+        let second = load_or_create_incarnation(&path, None);
+        assert!(!first.is_empty());
+        assert_eq!(
+            first, second,
+            "a bridge restart must present the same publisher incarnation"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_incarnation_checkpoint_is_replaced() {
+        let path = temp_checkpoint("empty");
+        fs::write(&path, "").expect("seed empty checkpoint");
+        let minted = load_or_create_incarnation(&path, Some("worker-a"));
+        assert!(minted.starts_with("worker-a:"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read checkpoint").trim(),
+            minted,
+            "an interrupted rotation must self-heal instead of wedging startup"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unwritable_incarnation_checkpoint_does_not_block_startup() {
+        // Parent directory does not exist, so every write attempt fails.
+        let path = temp_checkpoint("unwritable").join("nested.incarnation");
+        assert!(!load_or_create_incarnation(&path, None).is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rotation_drops_a_checkpoint_it_cannot_update() {
+        // A directory in place of the checkpoint fails every write.
+        let path = temp_checkpoint("rotate-unwritable");
+        fs::create_dir(&path).expect("seed directory in place of checkpoint");
+        let config = BridgeConfig {
+            incarnation_path: Some(path.clone()),
+            ..test_config(vec![])
+        };
+        let mut incarnation = config.incarnation.clone();
+        rotate_incarnation(&config, &mut incarnation);
+        assert_ne!(
+            incarnation, config.incarnation,
+            "rotation must proceed even when the checkpoint cannot be persisted"
+        );
+        let _ = fs::remove_dir(&path);
     }
 
     /// Build the apply-batch request the bridge would send for a set of events.

@@ -30,8 +30,10 @@ This crate is experimental.
   process-local.
 - Deploy one bridge per independent SGLang KV-event stream (for example, per DP
   rank), each with a unique `KV_INDEXER_WORKER_ID`.
-- Configure the replay endpoint in production. If a sequence gap cannot be
-  fully replayed, the bridge refuses to advance past it.
+- Configure the replay endpoint in production, and size SGLang's `buffer_steps`
+  to cover the longest expected bridge outage. Recovery is best effort: a gap
+  the buffer can no longer cover retires the worker incarnation, so the indexer
+  drops that worker's placements and the bridge resyncs from the live stream.
 - Redis Cluster is supported, but an apply batch spans multiple hash slots and
   is not globally atomic. Per-worker sequence and generation fencing preserve
   replay convergence.
@@ -133,7 +135,7 @@ endpoint.
 | `KV_INDEXER_CLEAR_TIERS` | `HBM,DRAM,SSD` | Tiers affected by `AllBlocksCleared` |
 | `KV_INDEXER_HEARTBEAT_SECS` | `30` | Worker heartbeat interval; `0` disables it |
 | `KV_INDEXER_WORKER_INCARNATION` | generated | Optional observable prefix for generated incarnation tokens |
-| `KV_INDEXER_WORKER_INCARNATION_FILE` | `/tmp/sgl-kv-indexer-<worker-id-hex>.incarnation` | Local checkpoint that preserves the publisher incarnation across bridge-only restarts; place it on a sidecar-persistent volume when Bridge and SGLang have different container lifecycles |
+| `KV_INDEXER_WORKER_INCARNATION_FILE` | `/tmp/sgl-kv-indexer-<worker-id-hex>.incarnation` | Local checkpoint that preserves the publisher incarnation across bridge-only restarts; place it on a sidecar-persistent volume when Bridge and SGLang have different container lifecycles. Best effort: an unwritable location only costs a full resync on restart, it never blocks startup |
 
 ## API
 
