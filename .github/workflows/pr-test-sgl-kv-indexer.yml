@@ -1,16 +1,16 @@
-name: SGL KV Indexer
+name: PR Test (sgl-kv-indexer)
 
 on:
   push:
     branches: [main]
     paths:
       - "experimental/sgl-kv-indexer/**"
-      - ".github/workflows/sgl-kv-indexer.yml"
+      - ".github/workflows/pr-test-sgl-kv-indexer.yml"
   pull_request:
     branches: [main]
     paths:
       - "experimental/sgl-kv-indexer/**"
-      - ".github/workflows/sgl-kv-indexer.yml"
+      - ".github/workflows/pr-test-sgl-kv-indexer.yml"
   workflow_dispatch:
 
 concurrency:
@@ -22,6 +22,32 @@ env:
   RUST_TOOLCHAIN: "1.97.0"
 
 jobs:
+  gate:
+    name: run-ci label gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.label.outputs.has_run_ci }}
+    steps:
+      # Only the six-node cluster tier is gated. `default-build` and `test` are
+      # cheap enough to always run, so a PR without the label still gets the
+      # crate compiled, linted, and tested against a single Redis.
+      - name: Check run-ci label
+        id: label
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event (${{ github.event_name }}); label gate bypassed."
+            exit 0
+          fi
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci') }}" == "true" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "PR has run-ci label; the Redis Cluster tier will run."
+          else
+            echo "has_run_ci=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR is missing the 'run-ci' label; skipping the six-node Redis Cluster tier. Apply the label to opt in."
+          fi
+
   default-build:
     name: default features build and test
     runs-on: ubuntu-latest
@@ -74,6 +100,9 @@ jobs:
 
     env:
       KV_INDEXER_REDIS_URL: redis://127.0.0.1:6379
+      # Turn a store that failed to come up into a red job rather than a green
+      # one in which every Redis test quietly skipped itself.
+      KV_INDEXER_REQUIRE_REDIS: "1"
 
     steps:
       - name: Checkout
@@ -101,8 +130,12 @@ jobs:
 
   redis-cluster:
     name: Redis Cluster redirects and failover
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      KV_INDEXER_REQUIRE_REDIS: "1"
     defaults:
       run:
         working-directory: experimental/sgl-kv-indexer
@@ -156,7 +189,7 @@ jobs:
           docker exec kvidx-c2 redis-cli cluster setslot "$slot" importing "$source_id"
           KV_INDEXER_ASK_HASH=failover-hash \
             cargo test --features redis-backend --test redis_integration \
-              cluster_client_follows_ask_redirect -- --nocapture --test-threads=1
+              cluster_client_follows_ask_redirect --exact -- --nocapture --test-threads=1
           for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
           docker exec kvidx-c1 redis-cli cluster setslot "$slot" stable
           docker exec kvidx-c2 redis-cli cluster setslot "$slot" stable
@@ -179,7 +212,7 @@ jobs:
           docker exec "$target" redis-cli cluster setslot "$slot" importing "$source_id"
           KV_INDEXER_ASK_HEARTBEAT_WORKER="$worker" \
             cargo test --features redis-backend --test redis_integration \
-              cluster_heartbeat_follows_ask_redirect -- --nocapture --test-threads=1
+              cluster_heartbeat_follows_ask_redirect --exact -- --nocapture --test-threads=1
           for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
           docker exec "$source" redis-cli cluster setslot "$slot" stable
           docker exec "$target" redis-cli cluster setslot "$slot" stable
@@ -191,7 +224,7 @@ jobs:
           KV_INDEXER_FAILOVER_HASH=failover-hash \
           KV_INDEXER_FAILOVER_PAUSE_SECS=12 \
             cargo test --features redis-backend --test redis_integration \
-              cluster_client_recovers_after_master_failover \
+              cluster_client_recovers_after_master_failover --exact \
               -- --nocapture --test-threads=1 &
           test_pid=$!
           sleep 3

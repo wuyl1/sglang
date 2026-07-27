@@ -13,6 +13,8 @@
 //! Each test uses a unique namespace so a shared store never causes collisions.
 #![cfg(feature = "redis-backend")]
 
+#[path = "common/require.rs"]
+mod require;
 #[path = "common/id.rs"]
 mod test_id;
 #[path = "common/kv.rs"]
@@ -49,7 +51,10 @@ async fn backend(test: &str) -> Option<RedisKvIndexerBackend> {
                 .expect("connect single"),
         )
     } else {
-        eprintln!("skipping {test}: set KV_INDEXER_REDIS_URL or KV_INDEXER_REDIS_CLUSTER_NODES");
+        require::skip(
+            test,
+            "neither KV_INDEXER_REDIS_URL nor KV_INDEXER_REDIS_CLUSTER_NODES is set",
+        );
         None
     }
 }

@@ -98,7 +98,12 @@ async fn generation_race_backend(test: &str) -> Option<RedisKvIndexerBackend> {
 
 async fn test_connection(test: &str) -> Option<SingleConn> {
     let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
-        eprintln!("skipping {test}: set KV_INDEXER_REDIS_URL");
+        // Same contract as tests/common/require.rs, which the integration
+        // suites use; this module lives in the library and cannot share it.
+        if std::env::var("KV_INDEXER_REQUIRE_REDIS").is_ok_and(|v| v == "1") {
+            panic!("{test} requires a store but KV_INDEXER_REDIS_URL is not set");
+        }
+        eprintln!("skipping {test}: KV_INDEXER_REDIS_URL is not set");
         return None;
     };
     Some(SingleConn::connect(&url).await.expect("connect redis"))

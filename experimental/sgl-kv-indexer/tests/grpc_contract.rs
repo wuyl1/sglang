@@ -10,6 +10,8 @@
 //! unique worker/hash ids so a shared store never causes collisions.
 #![cfg(feature = "redis-backend")]
 
+#[path = "common/require.rs"]
+mod require;
 #[path = "common/id.rs"]
 mod test_id;
 #[path = "common/kv.rs"]
@@ -62,7 +64,7 @@ async fn start(test: &str) -> Option<KvIndexerClient<tonic::transport::Channel>>
     let url = match std::env::var("KV_INDEXER_REDIS_URL") {
         Ok(u) => u,
         Err(_) => {
-            eprintln!("skipping {test}: set KV_INDEXER_REDIS_URL");
+            require::skip(test, "KV_INDEXER_REDIS_URL is not set");
             return None;
         }
     };

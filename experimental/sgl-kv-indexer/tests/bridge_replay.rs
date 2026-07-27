@@ -1,13 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end reliability test for the bridge's in-session sequence-gap
-//! recovery. A fake SGLang publisher (ZMQ PUB for live events + ROUTER for the
-//! replay buffer) emits batches with a deliberate hole in the `seq` stream; a
-//! capturing in-memory gRPC indexer records the `seq` of every applied batch.
-//! We assert the bridge detects the gap, pulls the missing batches from the
-//! replay endpoint (DEALER -> ROUTER), and applies everything exactly once in
-//! monotonic order.
+//! End-to-end reliability tests for the bridge's sequence-gap handling. A fake
+//! SGLang publisher (ZMQ PUB for live events + ROUTER for the replay buffer)
+//! emits batches with deliberate holes in the `seq` stream; a capturing
+//! in-memory gRPC indexer records the `seq` and incarnation of every applied
+//! batch.
+//!
+//! Both branches of the gap contract are covered, in this order:
+//!   * recoverable -- the bridge pulls the missing batches from the replay
+//!     endpoint (DEALER -> ROUTER) and applies everything exactly once in
+//!     monotonic order, keeping its incarnation;
+//!   * unrecoverable -- once the replay buffer can no longer close the gap the
+//!     bridge retires the incarnation, which is how the indexer is told to wipe
+//!     placements it can no longer reconstruct. This is the destructive path,
+//!     asserted in `bridge_recovers_seq_gap_via_replay`.
 //!
 //! No Redis required: the capturing backend implements `KvIndexerBackend`
 //! directly, so this runs in the default `cargo test`.
