@@ -12,11 +12,13 @@ pub mod pb {
 }
 
 mod service;
+mod shutdown;
 
 #[cfg(feature = "redis-backend")]
 pub mod redis_backend;
 
 pub use service::{KvIndexerBackend, KvIndexerService};
+pub use shutdown::shutdown_signal;
 
 #[cfg(feature = "redis-backend")]
 pub use redis_backend::RedisKvIndexerBackend;

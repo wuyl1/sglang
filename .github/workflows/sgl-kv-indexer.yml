@@ -17,7 +17,42 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # Must match experimental/sgl-kv-indexer/rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.97.0"
+
 jobs:
+  default-build:
+    name: default features build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: experimental/sgl-kv-indexer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-kv-indexer -> target
+
+      # Every other job enables `redis-backend`, so without this one the default
+      # feature set -- what a plain `cargo build` produces -- is never compiled.
+      - name: Run Clippy without optional features
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests without optional features
+        run: cargo test
+
   test:
     name: fmt, clippy, and Redis tests
     runs-on: ubuntu-latest
@@ -45,8 +80,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
       - name: Cache Rust build
@@ -76,8 +112,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
       - name: Cache Rust build

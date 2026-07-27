@@ -38,6 +38,28 @@ This crate is experimental.
   is not globally atomic. Per-worker sequence and generation fencing preserve
   replay convergence.
 
+### Known gaps
+
+These are accepted for an experimental crate and are listed so operators are not
+surprised by them:
+
+- After an incarnation is retired, the bridge resumes from the live event stream
+  rather than replaying the new publisher's earlier history. Blocks that SGLang
+  cached before the rotation and never re-reports stay absent from the index
+  until they are evicted and cached again. The index under-reports in that
+  window; it never reports a placement that does not exist, so routing degrades
+  to a cache miss rather than a wrong answer.
+- Retired incarnation tokens accumulate as `retired:<token>` fields in each
+  worker's meta hash and are never pruned. Growth is one small field per bridge
+  restart, so it is slow, but a worker restarted continuously for a long time
+  will keep a large meta hash. Deleting the worker's meta key clears it.
+- Sequence numbers are compared inside Lua, which uses double-precision
+  arithmetic, so values above 2^53 are not exact even though the proto field is
+  `uint64`. A publisher would have to emit ~9e15 batches to reach that point.
+- There is no periodic full-state reconciliation between SGLang and the index.
+  Convergence relies on replay and on incarnation rotation; a placement lost to
+  a gap is only restored when the block is reported again.
+
 ## Horizontal scaling
 
 Indexer servers share no persistent local state, so they can scale horizontally

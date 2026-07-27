@@ -11,7 +11,7 @@ use sgl_kv_indexer::pb::{
     GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvRequest,
     MatchExternalKvResponse,
 };
-use sgl_kv_indexer::{KvIndexerBackend, KvIndexerService};
+use sgl_kv_indexer::{shutdown_signal, KvIndexerBackend, KvIndexerService};
 use tonic::transport::Server;
 use tonic::Status;
 use tracing::info;
@@ -211,11 +211,5 @@ async fn select_backend(
             }
         }
         other => Err(format!("unknown KV_INDEXER_BACKEND: {other}").into()),
-    }
-}
-
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%error, "failed to install ctrl-c handler");
     }
 }

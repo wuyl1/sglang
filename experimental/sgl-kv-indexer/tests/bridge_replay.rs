@@ -15,6 +15,7 @@
 #[path = "common/net.rs"]
 mod test_net;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use tonic::transport::Server;
 use tonic::Status;
 use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-use sgl_kv_indexer::bridge::{run_bridge, BridgeConfig};
+use sgl_kv_indexer::bridge::{run_bridge, run_bridge_until, BridgeConfig};
 use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, GetExternalKvHitCountsRequest,
@@ -31,6 +32,10 @@ use sgl_kv_indexer::pb::{
 };
 use sgl_kv_indexer::{KvIndexerBackend, KvIndexerService};
 use test_net::free_addr;
+
+/// Sequence-tagged batches the fake publisher has emitted, shared between the
+/// test body and the replay responder.
+type ReplayBuffer = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
 /// gRPC backend that just records the seq of every applied batch, in order.
 #[derive(Clone, Default)]
@@ -397,4 +402,133 @@ async fn bridge_process_restart_resumes_from_durable_checkpoint() {
         .unwrap()
         .iter()
         .all(|value| value == "stable-publisher"));
+}
+
+/// A `SIGTERM`-style shutdown must return promptly and leave the indexer's
+/// checkpoint intact, so the replacement process replays what was published
+/// while nothing was listening rather than skipping it.
+#[tokio::test]
+async fn graceful_shutdown_keeps_the_replay_checkpoint_usable() {
+    let backend = CapturingBackend::default();
+    let seqs = backend.seqs.clone();
+    let grpc_addr = free_addr();
+    let svc = KvIndexerServer::new(KvIndexerService::new(backend));
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve(grpc_addr)
+            .await
+            .expect("grpc serve");
+    });
+
+    let mut publisher = PubSocket::new();
+    let pub_ep = publisher.bind("tcp://127.0.0.1:0").await.expect("bind pub");
+    let mut router = RouterSocket::new();
+    let router_ep = router.bind("tcp://127.0.0.1:0").await.expect("bind router");
+
+    // Stands in for SGLang's replay buffer: every batch the publisher has
+    // emitted, served from the requested sequence onwards.
+    let buffer: ReplayBuffer = Arc::new(Mutex::new(Vec::new()));
+    let replay = buffer.clone();
+    tokio::spawn(async move {
+        loop {
+            let req = router.recv().await.expect("router recv").into_vec();
+            let peer = req[0].clone();
+            let start = u64::from_be_bytes(req[2].as_ref().try_into().unwrap());
+            if start != u64::MAX {
+                let pending: Vec<(u64, Vec<u8>)> = replay
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(seq, _)| *seq >= start)
+                    .cloned()
+                    .collect();
+                for (seq, payload) in pending {
+                    router
+                        .send(reply_frame(peer.clone(), seq as i64, payload))
+                        .await
+                        .expect("router send replay");
+                }
+            }
+            router
+                .send(reply_frame(peer, -1, Vec::new()))
+                .await
+                .expect("router send terminator");
+        }
+    });
+
+    let config = BridgeConfig {
+        worker_id: "shutdown-worker".to_string(),
+        worker_address: String::new(),
+        event_endpoint: pub_ep.to_string(),
+        event_replay_endpoint: Some(router_ep.to_string()),
+        event_topic: String::new(),
+        indexer_endpoint: format!("http://{grpc_addr}"),
+        clear_tiers: vec![],
+        heartbeat_interval: None,
+        incarnation: "stable-publisher".to_string(),
+        incarnation_path: None,
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let signalled = stop.clone();
+    let first = tokio::spawn(run_bridge_until(config.clone(), async move {
+        while !signalled.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }));
+
+    // PUB drops messages sent before the subscriber has finished connecting.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    for seq in [0_u64, 1] {
+        let payload = stored_payload(5000 + seq as i64, "GPU");
+        buffer.lock().unwrap().push((seq, payload.clone()));
+        publisher
+            .send(pub_frame(seq, payload))
+            .await
+            .expect("publish live batch");
+    }
+    await_seqs(&seqs, 2).await;
+
+    stop.store(true, Ordering::Relaxed);
+    let stopped = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("bridge must return promptly after a shutdown signal")
+        .expect("bridge task must not panic");
+    assert!(stopped.is_ok(), "clean shutdown must not surface an error");
+
+    // Published into the void: the first bridge is gone and the second has not
+    // started, so these only exist in the replay buffer.
+    for seq in [2_u64, 3] {
+        let payload = stored_payload(5000 + seq as i64, "GPU");
+        buffer.lock().unwrap().push((seq, payload.clone()));
+        publisher
+            .send(pub_frame(seq, payload))
+            .await
+            .expect("publish during downtime");
+    }
+
+    tokio::spawn(run_bridge_until(config, std::future::pending()));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let payload = stored_payload(5004, "GPU");
+    buffer.lock().unwrap().push((4, payload.clone()));
+    publisher
+        .send(pub_frame(4, payload))
+        .await
+        .expect("publish after restart");
+
+    await_seqs(&seqs, 5).await;
+    assert_eq!(seqs.lock().unwrap().as_slice(), &[0, 1, 2, 3, 4]);
+}
+
+async fn await_seqs(seqs: &Arc<Mutex<Vec<u64>>>, want: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seqs.lock().unwrap().len() < want {
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "timed out waiting for {want} applied batches: {:?}",
+            *seqs.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

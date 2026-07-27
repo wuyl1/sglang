@@ -65,6 +65,9 @@ const DEFAULT_NAMESPACE: &str = "kvidx";
 /// processes them in sequential chunks so one request cannot create unbounded
 /// in-flight work against Redis.
 const REDIS_FANOUT_CHUNK: usize = 256;
+/// `COUNT` hint for reverse-index `SSCAN` iteration. Sized to match the fanout
+/// chunk so one scanned page turns into one round of concurrent cleanup.
+const REVERSE_SCAN_PAGE: usize = 256;
 
 /// Resolved connection target parsed from the environment.
 enum Target {
@@ -389,17 +392,23 @@ impl RedisKvIndexerBackend {
         meta_key: &str,
         generation: i64,
     ) -> Result<(), Status> {
-        let stale: Vec<ReverseMember> = self
-            .reverse_members(worker)
-            .await?
-            .into_iter()
-            .filter(|member| member.generation < generation)
-            .collect();
-        for chunk in stale.chunks(REDIS_FANOUT_CHUNK) {
-            try_join_all(chunk.iter().map(|member| {
-                self.clear_old_reverse_member(worker, &member.encoded, &member.hash, generation)
-            }))
-            .await?;
+        let mut cursor = 0;
+        loop {
+            let (next, page) = self.reverse_page(worker, cursor).await?;
+            let stale: Vec<ReverseMember> = page
+                .into_iter()
+                .filter(|member| member.generation < generation)
+                .collect();
+            for chunk in stale.chunks(REDIS_FANOUT_CHUNK) {
+                try_join_all(chunk.iter().map(|member| {
+                    self.clear_old_reverse_member(worker, &member.encoded, &member.hash, generation)
+                }))
+                .await?;
+            }
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
         }
 
         // Finish exactly once. A concurrent resetter arriving after another
@@ -443,13 +452,30 @@ impl RedisKvIndexerBackend {
         Ok(())
     }
 
-    async fn reverse_members(&self, worker: &str) -> Result<Vec<ReverseMember>, Status> {
-        let mut cmd = redis::cmd("SMEMBERS");
-        cmd.arg(worker_blocks_key(&self.ns, worker));
+    /// Reads one `SSCAN` page of a worker's reverse index, returning the next
+    /// cursor (`0` once the iteration is complete) alongside the members.
+    ///
+    /// `SMEMBERS` would occupy Redis for the whole set and materialize it in a
+    /// single reply, and a worker legitimately owns as many blocks as its cache
+    /// holds. Scanning may return a member more than once and may miss members
+    /// added or removed mid-iteration; both callers are idempotent and only act
+    /// on generations that are already settled, so neither matters here.
+    async fn reverse_page(
+        &self,
+        worker: &str,
+        cursor: u64,
+    ) -> Result<(u64, Vec<ReverseMember>), Status> {
+        let mut cmd = redis::cmd("SSCAN");
+        cmd.arg(worker_blocks_key(&self.ns, worker))
+            .arg(cursor)
+            .arg("COUNT")
+            .arg(REVERSE_SCAN_PAGE);
         let value = self.conn.query(cmd).await.map_err(to_status)?;
-        Vec::<String>::from_redis_value(&value)
-            .map_err(to_status)
-            .map(|members| members.into_iter().map(ReverseMember::parse).collect())
+        let (next, members) = <(u64, Vec<String>)>::from_redis_value(&value).map_err(to_status)?;
+        Ok((
+            next,
+            members.into_iter().map(ReverseMember::parse).collect(),
+        ))
     }
 
     /// Reads the worker's durable seq (`-1` when none has been stored yet).
@@ -548,15 +574,21 @@ impl RedisKvIndexerBackend {
         bit: i64,
         generation: i64,
     ) -> Result<(), Status> {
-        let hashes: Vec<String> = self
-            .reverse_members(worker)
-            .await?
-            .into_iter()
-            .filter_map(|member| (member.generation == generation).then_some(member.hash))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        self.revoke_many(worker, &hashes, bit, generation).await
+        let mut cursor = 0;
+        loop {
+            let (next, page) = self.reverse_page(worker, cursor).await?;
+            let hashes: Vec<String> = page
+                .into_iter()
+                .filter_map(|member| (member.generation == generation).then_some(member.hash))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            self.revoke_many(worker, &hashes, bit, generation).await?;
+            cursor = next;
+            if cursor == 0 {
+                return Ok(());
+            }
+        }
     }
 
     // --- read path ----------------------------------------------------------

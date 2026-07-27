@@ -304,6 +304,29 @@ impl EventActions {
 }
 
 pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
+    run_bridge_until(config, std::future::pending()).await
+}
+
+/// [`run_bridge`], but returns as soon as `shutdown` resolves.
+///
+/// Interrupting an in-flight apply is safe rather than merely tolerable: the
+/// indexer fences each worker's sequence, so a batch that was applied but never
+/// acknowledged is rejected as a duplicate when the next process replays it
+/// from the indexer's checkpoint.
+pub async fn run_bridge_until<F>(config: BridgeConfig, shutdown: F) -> Result<(), BridgeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        result = supervise(config) => result,
+        () = shutdown => {
+            info!("bridge stopped by shutdown signal");
+            Ok(())
+        }
+    }
+}
+
+async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
     info!(
         worker_id = %config.worker_id,
         event_endpoint = %config.event_endpoint,

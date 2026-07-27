@@ -403,11 +403,11 @@ async fn restart_reset_retried_after_mid_reset_failure() {
 #[tokio::test]
 async fn reset_window_hides_worker_from_match_until_reset_completes() {
     // P1: while a restart reset is pending, the worker's still-present placement
-    // must not be routed to. Fail the reset's very first step (SMEMBERS) so the
-    // stale placement/reverse entries survive with reset_pending=1, then assert
-    // `match` drops the worker (even with liveness TTL disabled) until a retry
-    // finishes the reset.
-    let Some(backend) = backend("reset_window", b"SMEMBERS").await else {
+    // must not be routed to. Fail the reset's very first step (the reverse-index
+    // SSCAN) so the stale placement/reverse entries survive with
+    // reset_pending=1, then assert `match` drops the worker (even with liveness
+    // TTL disabled) until a retry finishes the reset.
+    let Some(backend) = backend("reset_window", b"SSCAN").await else {
         return;
     };
 
@@ -415,8 +415,8 @@ async fn reset_window_hides_worker_from_match_until_reset_completes() {
     apply_ok(&backend, report("worker-0", 1, "A")).await;
     assert_eq!(matched_workers(&backend, "hash-a").await, vec!["worker-0"]);
 
-    // Incarnation "B": reset_pending is set, but SMEMBERS fails so the reset never
-    // clears the stale placement. The worker must now be hidden from match.
+    // Incarnation "B": reset_pending is set, but the SSCAN fails so the reset
+    // never clears the stale placement. The worker must now be hidden from match.
     let restart = report("worker-0", 1, "B");
     assert!(backend.apply(restart.clone()).await.is_err());
     assert_meta(&backend, "worker-0", "reset_pending", Some("1")).await;

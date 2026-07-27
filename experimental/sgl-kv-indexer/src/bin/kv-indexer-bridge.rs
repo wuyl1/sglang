@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use sgl_kv_indexer::bridge::{run_bridge, BridgeConfig};
+use sgl_kv_indexer::bridge::{run_bridge_until, BridgeConfig};
+use sgl_kv_indexer::shutdown_signal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,6 +13,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = BridgeConfig::from_env()?;
-    run_bridge(config).await?;
+    run_bridge_until(config, shutdown_signal()).await?;
     Ok(())
 }
