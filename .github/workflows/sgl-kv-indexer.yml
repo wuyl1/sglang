@@ -120,8 +120,32 @@ jobs:
           KV_INDEXER_ASK_HASH=failover-hash \
             cargo test --features redis-backend --test redis_integration \
               cluster_client_follows_ask_redirect -- --nocapture --test-threads=1
+          for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
           docker exec kvidx-c1 redis-cli cluster setslot "$slot" stable
           docker exec kvidx-c2 redis-cli cluster setslot "$slot" stable
+
+          worker=ask-heartbeat-worker
+          slot=$(docker exec kvidx-c1 redis-cli cluster keyslot "{w:$worker}")
+          if (( slot <= 5460 )); then
+            source=kvidx-c1
+            target=kvidx-c2
+          elif (( slot <= 10922 )); then
+            source=kvidx-c2
+            target=kvidx-c3
+          else
+            source=kvidx-c3
+            target=kvidx-c1
+          fi
+          source_id=$(docker exec "$source" redis-cli cluster myid)
+          target_id=$(docker exec "$target" redis-cli cluster myid)
+          docker exec "$source" redis-cli cluster setslot "$slot" migrating "$target_id"
+          docker exec "$target" redis-cli cluster setslot "$slot" importing "$source_id"
+          KV_INDEXER_ASK_HEARTBEAT_WORKER="$worker" \
+            cargo test --features redis-backend --test redis_integration \
+              cluster_heartbeat_follows_ask_redirect -- --nocapture --test-threads=1
+          for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
+          docker exec "$source" redis-cli cluster setslot "$slot" stable
+          docker exec "$target" redis-cli cluster setslot "$slot" stable
 
       - name: Exercise master failover on existing client
         run: |

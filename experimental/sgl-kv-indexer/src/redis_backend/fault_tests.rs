@@ -30,7 +30,7 @@ impl RedisConn for ChangeGenerationBeforeCommitConn {
 
     async fn invoke(
         &self,
-        script: &redis::Script,
+        script: &super::scripts::RedisScript,
         keys: Vec<String>,
         args: Vec<String>,
     ) -> redis::RedisResult<redis::Value> {
@@ -65,7 +65,7 @@ impl RedisConn for FailOnceConn {
 
     async fn invoke(
         &self,
-        script: &redis::Script,
+        script: &super::scripts::RedisScript,
         keys: Vec<String>,
         args: Vec<String>,
     ) -> redis::RedisResult<redis::Value> {
@@ -304,7 +304,7 @@ async fn late_concurrent_reset_cannot_delete_current_generation_state() {
     apply_ok(&backend, report(worker, 9, "inc-a")).await;
     let meta = worker_meta_key(&backend.ns, worker);
     let touch = backend
-        .touch_meta(&meta, worker, "", "inc-b")
+        .touch_meta(&meta, "", "inc-b")
         .await
         .expect("touch generation B");
     assert!(touch.reset_needed);

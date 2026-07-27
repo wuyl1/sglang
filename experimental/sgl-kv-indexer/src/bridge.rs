@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::Cursor;
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -38,10 +40,11 @@ pub struct BridgeConfig {
     /// liveness on the indexer, independent of KV-event traffic. Must be well
     /// below the server's `KV_INDEXER_WORKER_TTL_SECS`. `None` disables it.
     pub heartbeat_interval: Option<Duration>,
-    /// Opaque token identifying this worker lifetime, sent on every apply so the
-    /// indexer can detect a restart (new incarnation) and wipe the worker's
-    /// stale state + reset its seq. Defaults to a fresh per-process value.
+    /// Opaque token identifying the current SGLang publisher lifetime.
     pub incarnation: String,
+    /// Local checkpoint that keeps the incarnation stable across bridge-only
+    /// process restarts. A publisher sequence rollback rotates it atomically.
+    pub incarnation_path: Option<PathBuf>,
 }
 
 impl BridgeConfig {
@@ -61,11 +64,16 @@ impl BridgeConfig {
             &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
         let heartbeat_interval = parse_heartbeat_interval()?;
-        // Treat an operator value as an observable prefix, not a reusable token:
-        // retired tokens must never be presented by a later bridge process.
-        let incarnation = std::env::var("KV_INDEXER_WORKER_INCARNATION")
-            .map(|prefix| format!("{prefix}:{}", generate_incarnation()))
-            .unwrap_or_else(|_| generate_incarnation());
+        let incarnation_path = std::env::var_os("KV_INDEXER_WORKER_INCARNATION_FILE")
+            .map(PathBuf::from)
+            .or_else(|| Some(default_incarnation_path(&worker_id)));
+        let incarnation_prefix = std::env::var("KV_INDEXER_WORKER_INCARNATION").ok();
+        let incarnation = load_or_create_incarnation(
+            incarnation_path
+                .as_deref()
+                .expect("default incarnation path is always present"),
+            incarnation_prefix.as_deref(),
+        )?;
 
         Ok(Self {
             worker_id,
@@ -77,8 +85,94 @@ impl BridgeConfig {
             clear_tiers,
             heartbeat_interval,
             incarnation,
+            incarnation_path,
         })
     }
+}
+
+fn default_incarnation_path(worker_id: &str) -> PathBuf {
+    let encoded = worker_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::env::temp_dir().join(format!("sgl-kv-indexer-{encoded}.incarnation"))
+}
+
+fn new_incarnation(prefix: Option<&str>) -> String {
+    match prefix {
+        Some(prefix) => format!("{prefix}:{}", generate_incarnation()),
+        None => generate_incarnation(),
+    }
+}
+
+fn load_or_create_incarnation(path: &Path, prefix: Option<&str>) -> Result<String, BridgeError> {
+    match fs::read_to_string(path) {
+        Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_string()),
+        Ok(_) => {
+            return Err(BridgeError::Config(format!(
+                "incarnation file {} is empty",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(BridgeError::Config(format!(
+                "failed to read incarnation file {}: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    let incarnation = new_incarnation(prefix);
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file
+            .write_all(incarnation.as_bytes())
+            .map_err(|error| {
+                BridgeError::Config(format!(
+                    "failed to write incarnation file {}: {error}",
+                    path.display()
+                ))
+            })
+            .map(|()| incarnation),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => fs::read_to_string(path)
+            .map_err(|error| {
+                BridgeError::Config(format!(
+                    "failed to read concurrently-created incarnation file {}: {error}",
+                    path.display()
+                ))
+            })
+            .and_then(|value| {
+                let value = value.trim();
+                if value.is_empty() {
+                    Err(BridgeError::Config(format!(
+                        "incarnation file {} is empty",
+                        path.display()
+                    )))
+                } else {
+                    Ok(value.to_string())
+                }
+            }),
+        Err(error) => Err(BridgeError::Config(format!(
+            "failed to create incarnation file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn rotate_incarnation(config: &BridgeConfig, incarnation: &mut String) -> Result<(), BridgeError> {
+    let prefix = std::env::var("KV_INDEXER_WORKER_INCARNATION").ok();
+    let next = new_incarnation(prefix.as_deref());
+    if let Some(path) = &config.incarnation_path {
+        fs::write(path, &next).map_err(|error| {
+            BridgeError::Config(format!(
+                "failed to rotate incarnation file {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    *incarnation = next;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -320,7 +414,12 @@ async fn run_session(
     // is alive. Announce/refresh the incarnation immediately after that proof.
     if config.event_replay_endpoint.is_some() {
         match probe_publisher(config).await {
-            Ok(()) => send_heartbeat(config, incarnation, &mut client).await?,
+            Ok(()) => {
+                let checkpoint = send_heartbeat(config, incarnation, &mut client).await?;
+                if next_seq.is_none() {
+                    *next_seq = checkpoint.and_then(|seq| seq.checked_add(1));
+                }
+            }
             Err(error) => {
                 warn!(%error, "publisher startup probe failed; not refreshing worker liveness");
             }
@@ -356,7 +455,9 @@ async fn run_session(
                     && config.event_replay_endpoint.is_some() =>
             {
                 match probe_publisher(config).await {
-                    Ok(()) => send_heartbeat(config, incarnation, &mut client).await?,
+                    Ok(()) => {
+                        send_heartbeat(config, incarnation, &mut client).await?;
+                    }
                     Err(error) => {
                         warn!(%error, "publisher liveness probe failed; heartbeat suppressed");
                     }
@@ -392,7 +493,7 @@ async fn run_session(
                     actual = seq,
                     "SGLang KV event sequence moved backwards; treating publisher as restarted"
                 );
-                *incarnation = generate_incarnation();
+                rotate_incarnation(config, incarnation)?;
                 *next_seq = None;
                 *pending_batch = None;
                 send_heartbeat(config, incarnation, &mut client).await?;
@@ -620,7 +721,7 @@ async fn send_heartbeat(
     config: &BridgeConfig,
     incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
-) -> Result<(), BridgeError> {
+) -> Result<Option<u64>, BridgeError> {
     let request = ApplyExternalKvBatchRequest {
         worker_id: config.worker_id.clone(),
         seq: 0,
@@ -628,12 +729,15 @@ async fn send_heartbeat(
         worker_address: config.worker_address.clone(),
         incarnation: incarnation.to_string(),
     };
-    client
+    let response = client
         .apply_external_kv_batch(request)
         .await
-        .map_err(classify_rpc)?;
+        .map_err(classify_rpc)?
+        .into_inner();
     debug!(worker_id = %config.worker_id, "sent liveness heartbeat");
-    Ok(())
+    Ok(response
+        .has_applied_seq
+        .then_some(response.last_applied_seq))
 }
 
 /// Maps a decoded `EventActions` into a single `ApplyExternalKvBatchRequest`,
@@ -933,6 +1037,7 @@ mod tests {
             clear_tiers,
             heartbeat_interval: None,
             incarnation: "test-incarnation".to_string(),
+            incarnation_path: None,
         }
     }
 

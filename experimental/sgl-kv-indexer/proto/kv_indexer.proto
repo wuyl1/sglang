@@ -65,6 +65,10 @@ message ApplyExternalKvBatchResponse {
   uint64 last_applied_seq = 1;
   // True when the batch was skipped because its seq was already applied.
   bool duplicate = 2;
+  // False only when this worker incarnation has not committed any event batch
+  // yet. Heartbeat callers use this to distinguish a real durable seq=0 from
+  // the empty checkpoint of a fresh incarnation.
+  bool has_applied_seq = 3;
 }
 
 message TierHashes {

@@ -414,6 +414,29 @@ itest!(cluster_client_follows_ask_redirect, b, {
     assert_eq!(tiers_for(&result, "ask-worker", &hash), vec![hbm()]);
 });
 
+itest!(cluster_heartbeat_follows_ask_redirect, b, {
+    if std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES").is_err() {
+        eprintln!("skipping heartbeat ASK test outside Redis Cluster");
+        return;
+    }
+    let Ok(worker) = std::env::var("KV_INDEXER_ASK_HEARTBEAT_WORKER") else {
+        eprintln!("skipping heartbeat ASK test: set KV_INDEXER_ASK_HEARTBEAT_WORKER");
+        return;
+    };
+
+    // The harness migrates the `{w:<worker>}` slot before this call. TOUCH_META
+    // is a multi-key Lua heartbeat in that slot and must follow ASK even when
+    // the importing master has not cached the script.
+    let response = b
+        .apply_external_kv_batch(apply_req_inc(&worker, "a", "ask-heartbeat", 0, vec![]))
+        .await
+        .unwrap();
+    assert!(
+        !response.has_applied_seq,
+        "a fresh heartbeat must not invent a durable event checkpoint"
+    );
+});
+
 itest!(revoke_partial_tier_keeps_other_tier, b, {
     b.apply_external_kv_batch(apply_req(
         "w1",

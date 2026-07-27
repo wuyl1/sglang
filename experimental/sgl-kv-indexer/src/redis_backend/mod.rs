@@ -5,9 +5,9 @@
 //!
 //! Data model (see [`schema`]): placement is a per-block-hash HASH of
 //! `worker -> tier bitmask`; a per-worker SET is the reverse index; a per-worker
-//! durable HASH holds the registry (address, seq, incarnation, reset_pending)
-//! while a separate per-worker key carries the liveness TTL; hit counts live in a per-hash
-//! HASH co-located with placement (and are deleted together with the placement
+//! durable HASH holds the registry, sequence, incarnation fencing, retired
+//! tokens, and liveness deadline; hit counts live in a per-hash HASH co-located
+//! with placement (and are deleted together with the placement
 //! when a block is fully revoked, so they never outlive the block). All writes
 //! flow through
 //! [`RedisKvIndexerBackend::apply`], which is naturally idempotent (bit set/clear,
@@ -49,8 +49,7 @@ use crate::service::KvIndexerBackend;
 
 use conn::{ClusterConn, RedisConn, SingleConn};
 use schema::{
-    hit_key, placement_key, tier_bit, tiers_from_mask, worker_blocks_key, worker_live_key,
-    worker_meta_key, worker_retired_incarnations_key,
+    hit_key, placement_key, tier_bit, tiers_from_mask, worker_blocks_key, worker_meta_key,
 };
 use scripts::{
     HIT_BUMP, MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_CLEAR_WORKER, PLACEMENT_SET, RESET_FINISH,
@@ -252,7 +251,7 @@ impl RedisKvIndexerBackend {
         // Every accepted apply proves liveness and checks whether its incarnation
         // owes a new or previously interrupted reset.
         let touch = self
-            .touch_meta(&meta_key, worker, &req.worker_address, &req.incarnation)
+            .touch_meta(&meta_key, &req.worker_address, &req.incarnation)
             .await?;
         if touch.reset_needed {
             // Reset is idempotent; reset_pending clears only after full success.
@@ -267,6 +266,7 @@ impl RedisKvIndexerBackend {
             return Ok(ApplyExternalKvBatchResponse {
                 last_applied_seq: stored.max(0) as u64,
                 duplicate: false,
+                has_applied_seq: stored >= 0,
             });
         }
 
@@ -291,6 +291,7 @@ impl RedisKvIndexerBackend {
             return Ok(ApplyExternalKvBatchResponse {
                 last_applied_seq: last.max(0) as u64,
                 duplicate: true,
+                has_applied_seq: last >= 0,
             });
         }
 
@@ -334,6 +335,7 @@ impl RedisKvIndexerBackend {
         Ok(ApplyExternalKvBatchResponse {
             last_applied_seq: committed.max(0) as u64,
             duplicate: false,
+            has_applied_seq: committed >= 0,
         })
     }
 
@@ -342,7 +344,6 @@ impl RedisKvIndexerBackend {
     async fn touch_meta(
         &self,
         meta_key: &str,
-        worker: &str,
         addr: &str,
         incarnation: &str,
     ) -> Result<WorkerTouch, Status> {
@@ -358,11 +359,7 @@ impl RedisKvIndexerBackend {
             .conn
             .invoke(
                 &TOUCH_META,
-                vec![
-                    meta_key.to_string(),
-                    worker_live_key(&self.ns, worker),
-                    worker_retired_incarnations_key(&self.ns, worker),
-                ],
+                vec![meta_key.to_string()],
                 vec![
                     now_ms().to_string(),
                     ttl_ms.to_string(),
@@ -606,30 +603,28 @@ impl RedisKvIndexerBackend {
             }
         }
 
-        // Fetch each matched worker's `addr` (for routing) and liveness. When a
-        // TTL is configured, liveness is the presence of the separate
-        // `worker_live_key`, which expires once a worker stops applying /
-        // heartbeating; such stale workers are dropped so `match` never routes to
-        // a dead node while its placement/reverse entries linger. The durable
-        // meta itself never expires, so a revived worker keeps its seq/incarnation.
+        // Fetch each matched worker's `addr` (for routing) and liveness. The
+        // durable meta hash stores `live_until_ms`; stale workers are dropped so
+        // `match` never routes to a dead node while placement entries linger.
         let ttl_flag = if self.worker_ttl.is_some() { "1" } else { "0" };
+        let view_now_ms = now_ms().to_string();
         let mut metas = Vec::with_capacity(worker_order.len());
         for chunk in worker_order.chunks(REDIS_FANOUT_CHUNK) {
-            let values = try_join_all(chunk.iter().map(|worker| async move {
-                let v = self
-                    .conn
-                    .invoke(
-                        &WORKER_VIEW,
-                        vec![
-                            worker_meta_key(&self.ns, worker),
-                            worker_live_key(&self.ns, worker),
-                        ],
-                        vec![ttl_flag.to_string()],
-                    )
-                    .await?;
-                let (addr, alive, generation): (String, i64, i64) =
-                    <(String, i64, i64)>::from_redis_value(&v)?;
-                Ok::<_, redis::RedisError>((addr, alive == 1, generation))
+            let values = try_join_all(chunk.iter().map(|worker| {
+                let view_now_ms = view_now_ms.clone();
+                async move {
+                    let v = self
+                        .conn
+                        .invoke(
+                            &WORKER_VIEW,
+                            vec![worker_meta_key(&self.ns, worker)],
+                            vec![view_now_ms, ttl_flag.to_string()],
+                        )
+                        .await?;
+                    let (addr, alive, generation): (String, i64, i64) =
+                        <(String, i64, i64)>::from_redis_value(&v)?;
+                    Ok::<_, redis::RedisError>((addr, alive == 1, generation))
+                }
             }))
             .await
             .map_err(to_status)?;

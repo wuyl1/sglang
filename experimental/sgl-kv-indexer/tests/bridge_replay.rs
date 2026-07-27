@@ -37,6 +37,7 @@ use test_net::free_addr;
 struct CapturingBackend {
     seqs: Arc<Mutex<Vec<u64>>>,
     incarnations: Arc<Mutex<Vec<String>>>,
+    last_seq: Arc<Mutex<Option<u64>>>,
 }
 
 #[tonic::async_trait]
@@ -45,16 +46,21 @@ impl KvIndexerBackend for CapturingBackend {
         &self,
         request: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
-        if !request.actions.is_empty() {
+        let checkpoint = if request.actions.is_empty() {
+            *self.last_seq.lock().unwrap()
+        } else {
             self.seqs.lock().unwrap().push(request.seq);
             self.incarnations
                 .lock()
                 .unwrap()
                 .push(request.incarnation.clone());
-        }
+            *self.last_seq.lock().unwrap() = Some(request.seq);
+            Some(request.seq)
+        };
         Ok(ApplyExternalKvBatchResponse {
-            last_applied_seq: request.seq,
+            last_applied_seq: checkpoint.unwrap_or_default(),
             duplicate: false,
+            has_applied_seq: checkpoint.is_some(),
         })
     }
 
@@ -182,6 +188,7 @@ async fn bridge_recovers_seq_gap_via_replay() {
         clear_tiers: vec![],
         heartbeat_interval: None,
         incarnation: "replay-test".to_string(),
+        incarnation_path: None,
     };
     tokio::spawn(async move {
         let _ = run_bridge(config).await;
@@ -291,4 +298,93 @@ async fn bridge_recovers_seq_gap_via_replay() {
         &[0, 1, 2, 3, 4, 0, 1],
         "bridge must not advance past an incomplete replay gap"
     );
+}
+
+#[tokio::test]
+async fn bridge_process_restart_resumes_from_durable_checkpoint() {
+    let backend = CapturingBackend::default();
+    *backend.last_seq.lock().unwrap() = Some(1);
+    let seqs = backend.seqs.clone();
+    let incarnations = backend.incarnations.clone();
+    let grpc_addr = free_addr();
+    let svc = KvIndexerServer::new(KvIndexerService::new(backend));
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve(grpc_addr)
+            .await
+            .expect("grpc serve");
+    });
+
+    let mut publisher = PubSocket::new();
+    let pub_ep = publisher.bind("tcp://127.0.0.1:0").await.expect("bind pub");
+    let mut router = RouterSocket::new();
+    let router_ep = router.bind("tcp://127.0.0.1:0").await.expect("bind router");
+    tokio::spawn(async move {
+        loop {
+            let req = router.recv().await.expect("router recv").into_vec();
+            let peer = req[0].clone();
+            let start = u64::from_be_bytes(req[2].as_ref().try_into().unwrap());
+            if start == u64::MAX {
+                router
+                    .send(reply_frame(peer, -1, Vec::new()))
+                    .await
+                    .expect("router send probe");
+                continue;
+            }
+            assert_eq!(start, 2, "bridge must resume after durable seq 1");
+            for seq in [2_i64, 3] {
+                router
+                    .send(reply_frame(
+                        peer.clone(),
+                        seq,
+                        stored_payload(4000 + seq, "GPU"),
+                    ))
+                    .await
+                    .expect("router send replay");
+            }
+            router
+                .send(reply_frame(peer, -1, Vec::new()))
+                .await
+                .expect("router send terminator");
+        }
+    });
+
+    let config = BridgeConfig {
+        worker_id: "restart-worker".to_string(),
+        worker_address: String::new(),
+        event_endpoint: pub_ep.to_string(),
+        event_replay_endpoint: Some(router_ep.to_string()),
+        event_topic: String::new(),
+        indexer_endpoint: format!("http://{grpc_addr}"),
+        clear_tiers: vec![],
+        heartbeat_interval: None,
+        incarnation: "stable-publisher".to_string(),
+        incarnation_path: None,
+    };
+    tokio::spawn(async move {
+        let _ = run_bridge(config).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    publisher
+        .send(pub_frame(4, stored_payload(4004, "GPU")))
+        .await
+        .expect("publish post-restart live batch");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seqs.lock().unwrap().len() < 3 {
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "timed out waiting for restart replay: {:?}",
+            *seqs.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(seqs.lock().unwrap().as_slice(), &[2, 3, 4]);
+    assert!(incarnations
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|value| value == "stable-publisher"));
 }

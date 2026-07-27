@@ -17,7 +17,12 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use redis::{Cmd, ErrorKind, RedisError, RedisResult, Script, Value};
+use redis::{
+    Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, RedisResult,
+    Value,
+};
+
+use super::scripts::RedisScript;
 
 /// Per-attempt connect timeout and bounded retry policy. Without this the
 /// redis `ConnectionManager` default has no connection timeout, so a single
@@ -40,6 +45,61 @@ fn response_timeout_error() -> RedisError {
     RedisError::from((ErrorKind::IoError, "redis response timed out"))
 }
 
+fn eval_command(script: &RedisScript, keys: &[String], args: &[String]) -> Cmd {
+    let mut command = redis::cmd("EVAL");
+    command.arg(script.code).arg(keys.len());
+    for key in keys {
+        command.arg(key);
+    }
+    for arg in args {
+        command.arg(arg);
+    }
+    command
+}
+
+fn redirected_info(base: &ConnectionInfo, address: &str) -> RedisResult<ConnectionInfo> {
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        let (host, port) = rest.rsplit_once("]:").ok_or_else(|| {
+            RedisError::from((ErrorKind::InvalidClientConfig, "invalid redirect address"))
+        })?;
+        (host.to_string(), port)
+    } else {
+        let (host, port) = address.rsplit_once(':').ok_or_else(|| {
+            RedisError::from((ErrorKind::InvalidClientConfig, "invalid redirect address"))
+        })?;
+        (host.to_string(), port)
+    };
+    let port = port.parse::<u16>().map_err(|_| {
+        RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "invalid redirect address port",
+        ))
+    })?;
+    let addr = match &base.addr {
+        ConnectionAddr::Tcp(_, _) => ConnectionAddr::Tcp(host, port),
+        ConnectionAddr::TcpTls {
+            insecure,
+            tls_params,
+            ..
+        } => ConnectionAddr::TcpTls {
+            host,
+            port,
+            insecure: *insecure,
+            tls_params: tls_params.clone(),
+        },
+        ConnectionAddr::Unix(_) => {
+            return Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "Redis Cluster does not support Unix redirect addresses",
+            )));
+        }
+    };
+    Ok(ConnectionInfo {
+        addr,
+        redis: base.redis.clone(),
+    })
+}
+
 #[tonic::async_trait]
 pub(crate) trait RedisConn: Send + Sync + 'static {
     /// Runs a single command, routed by its key on Cluster.
@@ -49,7 +109,7 @@ pub(crate) trait RedisConn: Send + Sync + 'static {
     /// `keys[0]` on Cluster. All `keys` must share a hash tag.
     async fn invoke(
         &self,
-        script: &Script,
+        script: &RedisScript,
         keys: Vec<String>,
         args: Vec<String>,
     ) -> RedisResult<Value>;
@@ -111,7 +171,7 @@ impl RedisConn for SingleConn {
 
     async fn invoke(
         &self,
-        script: &Script,
+        script: &RedisScript,
         keys: Vec<String>,
         args: Vec<String>,
     ) -> RedisResult<Value> {
@@ -184,6 +244,35 @@ impl ClusterConn {
         *guard = Some(built.clone());
         Ok(built)
     }
+
+    async fn invoke_ask(
+        &self,
+        address: &str,
+        script: &RedisScript,
+        keys: &[String],
+        args: &[String],
+    ) -> RedisResult<Value> {
+        let base = self.nodes[0].as_str().into_connection_info()?;
+        let target = redirected_info(&base, address)?;
+        let client = redis::Client::open(target)?;
+        let mut connection =
+            tokio::time::timeout(CONNECT_TIMEOUT, client.get_multiplexed_async_connection())
+                .await
+                .map_err(|_| {
+                    RedisError::from((ErrorKind::IoError, "Redis ASK connect timed out"))
+                })??;
+        // ASKING only applies to the immediately following command. A pipeline
+        // keeps it adjacent to EVAL on this dedicated target connection.
+        let mut pipeline = redis::pipe();
+        pipeline.cmd("ASKING").ignore();
+        pipeline.add_command(eval_command(script, keys, args));
+        tokio::time::timeout(
+            RESPONSE_TIMEOUT,
+            pipeline.query_async::<Value>(&mut connection),
+        )
+        .await
+        .map_err(|_| response_timeout_error())?
+    }
 }
 
 #[tonic::async_trait]
@@ -201,24 +290,18 @@ impl RedisConn for ClusterConn {
 
     async fn invoke(
         &self,
-        script: &Script,
+        script: &RedisScript,
         keys: Vec<String>,
         args: Vec<String>,
     ) -> RedisResult<Value> {
-        let mut c = self.connection().await?;
-        let mut inv = script.prepare_invoke();
-        for k in &keys {
-            inv.key(k.as_str());
-        }
-        for a in &args {
-            inv.arg(a.as_str());
-        }
-        match tokio::time::timeout(RESPONSE_TIMEOUT, inv.invoke_async(&mut c)).await {
-            Ok(result) => result,
-            Err(_) => {
-                self.invalidate();
-                Err(response_timeout_error())
+        match self.query(eval_command(script, &keys, &args)).await {
+            Err(error) if error.kind() == ErrorKind::Ask => {
+                let Some((address, _)) = error.redirect_node() else {
+                    return Err(error);
+                };
+                self.invoke_ask(address, script, &keys, &args).await
             }
+            result => result,
         }
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,7 @@ use tracing::info;
 #[derive(Default)]
 struct LoggingKvIndexerBackend {
     live: Mutex<HashSet<(i32, String)>>,
+    seqs: Mutex<HashMap<String, u64>>,
 }
 
 impl LoggingKvIndexerBackend {
@@ -73,9 +74,19 @@ impl KvIndexerBackend for LoggingKvIndexerBackend {
             live_total = self.total(),
             "APPLY external kv batch"
         );
+        let checkpoint = if request.actions.is_empty() {
+            self.seqs.lock().unwrap().get(&request.worker_id).copied()
+        } else {
+            self.seqs
+                .lock()
+                .unwrap()
+                .insert(request.worker_id.clone(), request.seq);
+            Some(request.seq)
+        };
         Ok(ApplyExternalKvBatchResponse {
-            last_applied_seq: request.seq,
+            last_applied_seq: checkpoint.unwrap_or_default(),
             duplicate: false,
+            has_applied_seq: checkpoint.is_some(),
         })
     }
 

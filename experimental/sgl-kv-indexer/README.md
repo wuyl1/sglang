@@ -132,7 +132,8 @@ endpoint.
 | `SGLANG_KV_EVENT_TOPIC` | empty | ZMQ subscription topic |
 | `KV_INDEXER_CLEAR_TIERS` | `HBM,DRAM,SSD` | Tiers affected by `AllBlocksCleared` |
 | `KV_INDEXER_HEARTBEAT_SECS` | `30` | Worker heartbeat interval; `0` disables it |
-| `KV_INDEXER_WORKER_INCARNATION` | generated | Optional observable prefix for the generated incarnation token |
+| `KV_INDEXER_WORKER_INCARNATION` | generated | Optional observable prefix for generated incarnation tokens |
+| `KV_INDEXER_WORKER_INCARNATION_FILE` | `/tmp/sgl-kv-indexer-<worker-id-hex>.incarnation` | Local checkpoint that preserves the publisher incarnation across bridge-only restarts; place it on a sidecar-persistent volume when Bridge and SGLang have different container lifecycles |
 
 ## API
 

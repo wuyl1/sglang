@@ -31,25 +31,11 @@ pub fn worker_blocks_key(ns: &str, worker_id: &str) -> String {
 }
 
 /// Durable registry for a worker: HASH with fields `addr`, `seq`,
-/// `incarnation`, `generation`, `reset_pending`. Never expires.
+/// `incarnation`, `generation`, `reset_pending`, `live_until_ms`, and
+/// `retired:<incarnation>`. Never expires. Keeping worker metadata in one key
+/// lets heartbeat Lua remain valid during Redis Cluster slot migration.
 pub fn worker_meta_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:meta")
-}
-
-/// Liveness marker for a worker: a short key refreshed with a TTL on every apply
-/// / heartbeat. Its presence (not the durable meta) is what `match` uses to
-/// decide a worker is still alive, so an expired-and-revived worker keeps its
-/// durable seq/incarnation. Shares the `{w:<worker>}` tag with the other
-/// per-worker keys so it stays in the same cluster slot.
-pub fn worker_live_key(ns: &str, worker_id: &str) -> String {
-    format!("{ns}:{{w:{worker_id}}}:live")
-}
-
-/// Durable set of superseded incarnation tokens. A delayed request carrying a
-/// retired token is rejected instead of being allowed to roll the current
-/// incarnation backwards.
-pub fn worker_retired_incarnations_key(ns: &str, worker_id: &str) -> String {
-    format!("{ns}:{{w:{worker_id}}}:retired")
 }
 
 /// The bit representing a tier in a placement bitmask.
@@ -77,11 +63,6 @@ mod tests {
     fn worker_keys_share_worker_tag() {
         assert_eq!(worker_blocks_key("kvidx", "w1"), "kvidx:{w:w1}:blocks");
         assert_eq!(worker_meta_key("kvidx", "w1"), "kvidx:{w:w1}:meta");
-        assert_eq!(worker_live_key("kvidx", "w1"), "kvidx:{w:w1}:live");
-        assert_eq!(
-            worker_retired_incarnations_key("kvidx", "w1"),
-            "kvidx:{w:w1}:retired"
-        );
     }
 
     #[test]

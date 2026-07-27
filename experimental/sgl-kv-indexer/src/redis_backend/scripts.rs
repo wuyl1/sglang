@@ -11,28 +11,55 @@ use std::sync::LazyLock;
 
 use redis::Script;
 
+/// Script code plus redis-rs' cached-SHA invocation helper.
+///
+/// Cluster connections use `code` with EVAL so ASK redirects do not depend on
+/// the importing node already having the SHA cached.
+pub struct RedisScript {
+    pub code: &'static str,
+    inner: Script,
+}
+
+impl RedisScript {
+    fn new(code: &'static str) -> Self {
+        Self {
+            code,
+            inner: Script::new(code),
+        }
+    }
+}
+
+impl std::ops::Deref for RedisScript {
+    type Target = Script;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// Refreshes a worker's liveness, records its address/incarnation in the durable
 /// meta hash, and reports whether a restart reset is owed.
 ///
-/// KEYS: `[worker_meta_key, worker_live_key, worker_retired_incarnations_key]`
+/// KEYS: `[worker_meta_key]`
 /// ARGV: `[now_ms, ttl_ms, addr, incarnation]`
 ///
 /// The durable meta hash (`seq`, `incarnation`, `addr`, `reset_pending`) never
-/// expires; liveness lives in the separate `worker_live_key`, which is (re)armed
-/// with a `ttl_ms` TTL only when `ttl_ms > 0`. Writes `addr` only when non-empty.
+/// expires. Liveness is a `live_until_ms` field; retired incarnations are
+/// `retired:<token>` fields in the same hash. Keeping this operation single-key
+/// is required for ASK redirects during Redis Cluster slot migration.
 /// `PERSIST`s the meta key so that a meta left with a TTL by an older build (which
 /// used to expire the whole hash) is made durable on first contact — otherwise it
 /// could still expire and lose `incarnation`, resurrecting a restarted worker's
 /// stale placements. When `incarnation` is non-empty and *differs* from the
 /// stored one (a restart), the new value is stored and a durable `reset_pending`
 /// flag is set so the caller wipes the previous incarnation's state. The old
-/// token is added to the durable retired set; a later request carrying a retired
-/// token returns status `-1` and cannot roll the current incarnation backwards.
+/// token is retained as a field in the durable hash; a later request carrying a
+/// retired token returns status `-1` and cannot roll the incarnation backwards.
 /// Returns `{status, generation}` where status is `-1` for a retired token, `1`
 /// when reset is pending, and `0` otherwise. Generation starts at zero and is
 /// incremented on every accepted incarnation change.
-pub static TOUCH_META: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static TOUCH_META: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 redis.call('PERSIST', KEYS[1])
 local generation = tonumber(redis.call('HGET', KEYS[1], 'generation')) or 0
@@ -41,10 +68,10 @@ if ARGV[4] ~= '' then
   if not prev then
     redis.call('HSET', KEYS[1], 'incarnation', ARGV[4], 'generation', generation)
   elseif prev ~= ARGV[4] then
-    if redis.call('SISMEMBER', KEYS[3], ARGV[4]) == 1 then
+    if redis.call('HEXISTS', KEYS[1], 'retired:' .. ARGV[4]) == 1 then
       return {-1, generation}
     end
-    redis.call('SADD', KEYS[3], prev)
+    redis.call('HSET', KEYS[1], 'retired:' .. prev, '1')
     generation = redis.call('HINCRBY', KEYS[1], 'generation', 1)
     redis.call('HSET', KEYS[1], 'incarnation', ARGV[4])
     redis.call('HSET', KEYS[1], 'reset_pending', '1')
@@ -54,7 +81,9 @@ if ARGV[3] ~= '' then
   redis.call('HSET', KEYS[1], 'addr', ARGV[3])
 end
 if tonumber(ARGV[2]) > 0 then
-  redis.call('SET', KEYS[2], ARGV[1], 'PX', tonumber(ARGV[2]))
+  redis.call('HSET', KEYS[1], 'live_until_ms', tonumber(ARGV[1]) + tonumber(ARGV[2]))
+else
+  redis.call('HDEL', KEYS[1], 'live_until_ms')
 end
 if redis.call('HGET', KEYS[1], 'reset_pending') == '1' then
   return {1, generation}
@@ -66,15 +95,15 @@ return {0, generation}
 
 /// Reads a worker's routing address and liveness for `match`.
 ///
-/// KEYS: `[worker_meta_key, worker_live_key]`
-/// ARGV: `[ttl_enabled ("0"|"1")]`
+/// KEYS: `[worker_meta_key]`
+/// ARGV: `[now_ms, ttl_enabled ("0"|"1")]`
 /// Returns `{addr, alive, generation}`.
 /// `alive` is `0` when a restart reset is still pending (`reset_pending=1`) — the
 /// worker's placement is being wiped and must not be routed to, regardless of the
-/// TTL setting — or, when liveness is enabled, when the `worker_live_key` has
-/// expired (the worker stopped applying/heartbeating). Otherwise `1`.
-pub static WORKER_VIEW: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+/// TTL setting — or, when liveness is enabled, when `live_until_ms` is in the
+/// past (the worker stopped applying/heartbeating). Otherwise `1`.
+pub static WORKER_VIEW: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 local addr = redis.call('HGET', KEYS[1], 'addr')
 if not addr then addr = '' end
@@ -83,8 +112,9 @@ if redis.call('HGET', KEYS[1], 'reset_pending') == '1' then
   return {addr, 0, generation}
 end
 local alive = 1
-if ARGV[1] == '1' and redis.call('EXISTS', KEYS[2]) == 0 then
-  alive = 0
+if ARGV[2] == '1' then
+  local live_until_ms = tonumber(redis.call('HGET', KEYS[1], 'live_until_ms')) or 0
+  if live_until_ms < tonumber(ARGV[1]) then alive = 0 end
 end
 return {addr, alive, generation}
 "#,
@@ -98,8 +128,8 @@ return {addr, alive, generation}
 /// ARGV: `[worker_id, current_generation]`
 /// Deletes the co-located hit key when the placement hash becomes empty, mirror-
 /// ing [`PLACEMENT_CLEAR`] so an evicted block cannot leak its `:h` key.
-pub static PLACEMENT_CLEAR_WORKER: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static PLACEMENT_CLEAR_WORKER: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if raw then
@@ -128,8 +158,8 @@ return 1
 /// ARGV: `[seq, expected_generation]`
 /// Returns `{proceed, last}`: `proceed=-1` if the worker generation changed
 /// after TOUCH_META, `0` for a duplicate, and `1` otherwise.
-pub static SEQ_CHECK: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static SEQ_CHECK: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 local last = redis.call('HGET', KEYS[1], 'seq')
 local generation = tonumber(redis.call('HGET', KEYS[1], 'generation')) or 0
@@ -156,8 +186,8 @@ return {1, last}
 /// the apply path (never for a duplicate), and only after the batch mutations
 /// have committed, so a crash between mutations and this call simply leaves the
 /// stored seq behind and the next (idempotent) replay repairs it.
-pub static SEQ_COMMIT: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static SEQ_COMMIT: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 local last = redis.call('HGET', KEYS[1], 'seq')
 local generation = tonumber(redis.call('HGET', KEYS[1], 'generation')) or 0
@@ -179,8 +209,8 @@ return {1, last}
 ///
 /// KEYS: `[worker_meta_key]`
 /// ARGV: `[expected_generation]`
-pub static RESET_FINISH: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static RESET_FINISH: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 local generation = tonumber(redis.call('HGET', KEYS[1], 'generation')) or 0
 if generation ~= tonumber(ARGV[1]) then return -1 end
@@ -200,8 +230,8 @@ return 1
 /// changed, else `0`. The caller always performs
 /// the idempotent reverse-index `SADD`, even when this script returns `0`, so a
 /// replay repairs a prior failure between the two index updates.
-pub static PLACEMENT_SET: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static PLACEMENT_SET: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 local cur = 0
@@ -241,8 +271,8 @@ return 1
 /// the co-located hit key (same `{hash}` slot) is deleted in the same script.
 /// Otherwise a matched-then-evicted block would leak its `:h` key forever, since
 /// the hit key is created lazily on match and nothing else ever removes it.
-pub static PLACEMENT_CLEAR: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static PLACEMENT_CLEAR: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 local cur = nil
@@ -299,8 +329,8 @@ return {worker_gone, empty}
 /// KEYS: `[placement_key]`
 /// Returns `[worker, "generation:mask", ...]`. Legacy numeric masks are
 /// interpreted by the caller as generation zero.
-pub static MATCH_HASH: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static MATCH_HASH: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 return redis.call('HGETALL', KEYS[1])
 "#,
@@ -312,8 +342,8 @@ return redis.call('HGETALL', KEYS[1])
 ///
 /// KEYS: `[placement_key, hit_key]`
 /// ARGV: `[now_ms, worker_id, generation, ...]`
-pub static HIT_BUMP: LazyLock<Script> = LazyLock::new(|| {
-    Script::new(
+pub static HIT_BUMP: LazyLock<RedisScript> = LazyLock::new(|| {
+    RedisScript::new(
         r#"
 for i = 2, #ARGV, 2 do
   local raw = redis.call('HGET', KEYS[1], ARGV[i])
