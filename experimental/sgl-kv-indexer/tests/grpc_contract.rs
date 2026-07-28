@@ -106,9 +106,9 @@ fn apply_report(
 #[tokio::test]
 async fn disjoint_workers_scale_across_two_indexer_servers() {
     let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
-        eprintln!(
-            "skipping disjoint_workers_scale_across_two_indexer_servers: \
-             set KV_INDEXER_REDIS_URL"
+        require::skip(
+            "disjoint_workers_scale_across_two_indexer_servers",
+            "KV_INDEXER_REDIS_URL is not set",
         );
         return;
     };

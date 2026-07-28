@@ -8,6 +8,9 @@ on:
       - ".github/workflows/pr-test-sgl-kv-indexer.yml"
   pull_request:
     branches: [main]
+    # `labeled` is required for the run-ci gate below: without it, applying the
+    # label after the last push would never re-trigger the cluster tier.
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "experimental/sgl-kv-indexer/**"
       - ".github/workflows/pr-test-sgl-kv-indexer.yml"
