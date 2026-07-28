@@ -192,7 +192,7 @@ jobs:
           docker exec kvidx-c2 redis-cli cluster setslot "$slot" importing "$source_id"
           KV_INDEXER_ASK_HASH=failover-hash \
             cargo test --features redis-backend --test redis_integration \
-              cluster_client_follows_ask_redirect --exact -- --nocapture --test-threads=1
+              cluster_client_follows_ask_redirect -- --exact --nocapture --test-threads=1
           for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
           docker exec kvidx-c1 redis-cli cluster setslot "$slot" stable
           docker exec kvidx-c2 redis-cli cluster setslot "$slot" stable
@@ -215,7 +215,7 @@ jobs:
           docker exec "$target" redis-cli cluster setslot "$slot" importing "$source_id"
           KV_INDEXER_ASK_HEARTBEAT_WORKER="$worker" \
             cargo test --features redis-backend --test redis_integration \
-              cluster_heartbeat_follows_ask_redirect --exact -- --nocapture --test-threads=1
+              cluster_heartbeat_follows_ask_redirect -- --exact --nocapture --test-threads=1
           for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
           docker exec "$source" redis-cli cluster setslot "$slot" stable
           docker exec "$target" redis-cli cluster setslot "$slot" stable
@@ -227,8 +227,8 @@ jobs:
           KV_INDEXER_FAILOVER_HASH=failover-hash \
           KV_INDEXER_FAILOVER_PAUSE_SECS=12 \
             cargo test --features redis-backend --test redis_integration \
-              cluster_client_recovers_after_master_failover --exact \
-              -- --nocapture --test-threads=1 &
+              cluster_client_recovers_after_master_failover \
+              -- --exact --nocapture --test-threads=1 &
           test_pid=$!
           sleep 3
           docker stop kvidx-c1

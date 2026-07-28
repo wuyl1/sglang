@@ -20,6 +20,28 @@ The bridge detects sequence gaps and requests missing batches from SGLang's
 replay endpoint. The indexer uses per-worker sequence gating and incarnation
 fencing so duplicate or delayed batches cannot overwrite newer state.
 
+## Recommended deployment
+
+For production, run one bridge as a sidecar alongside each independent SGLang
+KV-event stream (for example, per DP rank):
+
+```text
+SGLang worker ──local ZMQ──> bridge ──gRPC──> indexer ──> Redis
+```
+
+- Co-locate the bridge and publisher in one Pod or container group, keep ZMQ
+  traffic local, and give each stream a unique `KV_INDEXER_WORKER_ID`.
+- Configure `SGLANG_KV_EVENT_REPLAY_ENDPOINT` in production. Size SGLang's
+  replay `buffer_steps` to cover the longest expected bridge or indexer outage.
+- Persist `KV_INDEXER_WORKER_INCARNATION_FILE` across bridge-only restarts; a
+  shared Kubernetes `emptyDir` is normally sufficient.
+- Assign each bridge to exactly one indexer server. Apply traffic for one worker
+  must not be distributed across servers; match queries may be load-balanced.
+- Keep inference readiness independent of this advisory index, and monitor
+  bridge and indexer health separately.
+- Prefer a single Redis or Dragonfly instance when sufficient; use Redis Cluster
+  when horizontal throughput or shard-level failover is required.
+
 ## Best-effort fault tolerance
 
 The index is advisory routing metadata, not the source of truth. Callers must
