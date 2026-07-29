@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
+
 use tonic::{Request, Response, Status};
 
 use crate::pb::kv_indexer_server::KvIndexer;
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
-    ExternalKvActionType, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    ExternalKvActionType, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
+    GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
     MatchExternalKvRequest, MatchExternalKvResponse,
 };
 
@@ -37,6 +40,41 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
         request: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status>;
 
+    /// Answers, per worker, the longest contiguous request prefix it holds.
+    ///
+    /// This default implementation *is* the written definition of the prefix
+    /// semantics: it composes `match_external_kv` and walks each worker's
+    /// matched set in request order, so any backend that overrides it for
+    /// performance must stay field-for-field identical (except `blocks_read`,
+    /// which is observability, not semantics).
+    ///
+    /// The semantics are deliberately stricter than `sgl-router`'s in-process
+    /// `HashTree::match_prefix`: a worker's prefix stops at the first block it is
+    /// missing, so the indexer never reports a worker as holding a prefix it
+    /// cannot actually serve. It can only under-report, never over-report.
+    async fn match_external_kv_prefix(
+        &self,
+        request: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        let limit = prefix_limit(request.hashes.len(), request.max_blocks);
+        let hashes: Vec<String> = request.hashes.into_iter().take(limit).collect();
+        if hashes.is_empty() {
+            return Ok(MatchExternalKvPrefixResponse::default());
+        }
+        let matched = self
+            .match_external_kv(MatchExternalKvRequest {
+                hashes: hashes.clone(),
+                count_as_hit: false,
+            })
+            .await?;
+        // The default path reads placement for every considered block.
+        Ok(build_prefix_response(
+            &hashes,
+            &matched,
+            hashes.len() as u32,
+        ))
+    }
+
     async fn get_external_kv_hit_counts(
         &self,
         request: GetExternalKvHitCountsRequest,
@@ -59,6 +97,13 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
         request: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status> {
         (**self).match_external_kv(request).await
+    }
+
+    async fn match_external_kv_prefix(
+        &self,
+        request: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        (**self).match_external_kv_prefix(request).await
     }
 
     async fn get_external_kv_hit_counts(
@@ -95,6 +140,16 @@ where
         let request = request.into_inner();
         validate_hashes(&request.hashes)?;
         let response = self.backend.match_external_kv(request).await?;
+        Ok(Response::new(response))
+    }
+
+    async fn match_external_kv_prefix(
+        &self,
+        request: Request<MatchExternalKvPrefixRequest>,
+    ) -> Result<Response<MatchExternalKvPrefixResponse>, Status> {
+        let request = request.into_inner();
+        validate_hashes(&request.hashes)?;
+        let response = self.backend.match_external_kv_prefix(request).await?;
         Ok(Response::new(response))
     }
 
@@ -185,9 +240,85 @@ fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
     Ok(())
 }
 
+/// Number of leading blocks to consider for a prefix query: bounded by the
+/// request length and, when the caller set one, by `max_blocks` (0 disables the
+/// caller ceiling). Backends may impose their own additional scan cap.
+pub(crate) fn prefix_limit(len: usize, max_blocks: u32) -> usize {
+    if max_blocks == 0 {
+        len
+    } else {
+        len.min(max_blocks as usize)
+    }
+}
+
+/// Derives the prefix response from a `MatchExternalKv` result — the semantic
+/// definition consumed by the trait default implementation. Each worker's prefix
+/// is the run of leading `hashes` it holds contiguously; the walk stops at the
+/// first missing block.
+pub(crate) fn build_prefix_response(
+    hashes: &[String],
+    matched: &MatchExternalKvResponse,
+    blocks_read: u32,
+) -> MatchExternalKvPrefixResponse {
+    let entries = matched
+        .matches
+        .iter()
+        .filter_map(|node| {
+            // An empty address is unroutable for the router (see the proto's
+            // worker_address contract); drop it rather than report a match it
+            // can never intersect.
+            if node.address.is_empty() {
+                return None;
+            }
+            let held: HashSet<&str> = node
+                .hashes_by_tier
+                .iter()
+                .flat_map(|tier| tier.hashes.iter().map(String::as_str))
+                .collect();
+            let mut prefix = 0u32;
+            for hash in hashes {
+                if held.contains(hash.as_str()) {
+                    prefix += 1;
+                } else {
+                    break;
+                }
+            }
+            (prefix > 0).then(|| (node.worker_id.clone(), node.address.clone(), prefix))
+        })
+        .collect();
+    assemble_prefix_response(entries, blocks_read)
+}
+
+/// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds
+/// the response. Shared so the Redis fast path, which computes prefixes during
+/// its scan, produces byte-identical shape to the default implementation.
+pub(crate) fn assemble_prefix_response(
+    mut entries: Vec<(String, String, u32)>,
+    blocks_read: u32,
+) -> MatchExternalKvPrefixResponse {
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+    let best_prefix_blocks = entries.first().map(|entry| entry.2).unwrap_or(0);
+    let matches = entries
+        .into_iter()
+        .map(
+            |(worker_id, worker_address, matched_prefix_blocks)| ExternalKvPrefixMatch {
+                worker_address,
+                matched_prefix_blocks,
+                worker_id,
+            },
+        )
+        .collect();
+    MatchExternalKvPrefixResponse {
+        matches,
+        best_prefix_blocks,
+        blocks_read,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pb::{ExternalKvNodeMatch, TierHashes};
 
     fn hbm() -> i32 {
         crate::pb::TierType::TierHbm as i32
@@ -269,5 +400,88 @@ mod tests {
     fn validate_worker_id_rejects_empty_value() {
         assert!(validate_worker_id("").is_err());
         assert!(validate_worker_id("worker-1").is_ok());
+    }
+
+    fn strs(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    /// Builds a single-tier `MatchExternalKv` result for one worker.
+    fn node(worker: &str, address: &str, held: &[&str]) -> ExternalKvNodeMatch {
+        ExternalKvNodeMatch {
+            worker_id: worker.to_string(),
+            address: address.to_string(),
+            hashes_by_tier: vec![TierHashes {
+                tier: hbm(),
+                hashes: strs(held),
+            }],
+        }
+    }
+
+    #[test]
+    fn prefix_limit_honors_caller_ceiling_and_zero() {
+        assert_eq!(prefix_limit(10, 0), 10);
+        assert_eq!(prefix_limit(10, 4), 4);
+        assert_eq!(prefix_limit(3, 4), 3);
+    }
+
+    #[test]
+    fn prefix_stops_at_first_missing_block() {
+        let hashes = strs(&["a", "b", "c", "d"]);
+        // Holds a,b then a hole at c: prefix is 2 even though it also holds d.
+        let matched = MatchExternalKvResponse {
+            matches: vec![node("w1", "10.0.0.1:1", &["a", "b", "d"])],
+        };
+        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
+        assert_eq!(resp.best_prefix_blocks, 2);
+        assert_eq!(resp.blocks_read, 4);
+        assert_eq!(resp.matches.len(), 1);
+        assert_eq!(resp.matches[0].matched_prefix_blocks, 2);
+        assert_eq!(resp.matches[0].worker_address, "10.0.0.1:1");
+    }
+
+    #[test]
+    fn prefix_excludes_empty_address_and_zero_prefix_workers() {
+        let hashes = strs(&["a", "b"]);
+        let matched = MatchExternalKvResponse {
+            matches: vec![
+                node("routable", "10.0.0.1:1", &["a", "b"]),
+                node("no-addr", "", &["a", "b"]),
+                node("no-first-block", "10.0.0.2:1", &["b"]),
+            ],
+        };
+        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
+        let ids: Vec<&str> = resp.matches.iter().map(|m| m.worker_id.as_str()).collect();
+        assert_eq!(ids, vec!["routable"]);
+        assert_eq!(resp.best_prefix_blocks, 2);
+    }
+
+    #[test]
+    fn prefix_matches_sorted_descending() {
+        let hashes = strs(&["a", "b", "c"]);
+        let matched = MatchExternalKvResponse {
+            matches: vec![
+                node("short", "10.0.0.1:1", &["a"]),
+                node("long", "10.0.0.2:1", &["a", "b", "c"]),
+                node("mid", "10.0.0.3:1", &["a", "b"]),
+            ],
+        };
+        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
+        let order: Vec<u32> = resp
+            .matches
+            .iter()
+            .map(|m| m.matched_prefix_blocks)
+            .collect();
+        assert_eq!(order, vec![3, 2, 1]);
+        assert_eq!(resp.best_prefix_blocks, 3);
+    }
+
+    #[test]
+    fn prefix_empty_when_no_worker_holds_first_block() {
+        let hashes = strs(&["a", "b"]);
+        let matched = MatchExternalKvResponse { matches: vec![] };
+        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
+        assert!(resp.matches.is_empty());
+        assert_eq!(resp.best_prefix_blocks, 0);
     }
 }
