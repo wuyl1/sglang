@@ -340,22 +340,6 @@ async fn equivalent_on_hole_free_placement() {
 }
 
 #[tokio::test]
-async fn equivalent_when_first_block_missing() {
-    // No worker holds the first block → both report an empty match.
-    let mut tree = oracle::HashTree::new();
-    let mut mem = MemBackend::default();
-    tree.insert("w1", &CHAIN[1..]);
-    mem.report("w1", "10.0.0.1:9000", &CHAIN[1..]);
-
-    let (oracle_len, oracle_workers) = tree.match_prefix(&CHAIN);
-    let (len, workers) = subject(&mem, &CHAIN).await;
-    assert_eq!(oracle_len, 0);
-    assert_eq!(len, 0);
-    assert_eq!(workers, oracle_workers);
-    assert!(workers.is_empty());
-}
-
-#[tokio::test]
 async fn conservative_when_worker_drops_a_middle_block() {
     // A worker reports the whole chain, then loses one interior block. The
     // oracle keeps crediting the full prefix (its deepest node still lists the

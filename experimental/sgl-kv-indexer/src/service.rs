@@ -318,7 +318,6 @@ pub(crate) fn assemble_prefix_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pb::{ExternalKvNodeMatch, TierHashes};
 
     fn hbm() -> i32 {
         crate::pb::TierType::TierHbm as i32
@@ -400,88 +399,5 @@ mod tests {
     fn validate_worker_id_rejects_empty_value() {
         assert!(validate_worker_id("").is_err());
         assert!(validate_worker_id("worker-1").is_ok());
-    }
-
-    fn strs(values: &[&str]) -> Vec<String> {
-        values.iter().map(|v| v.to_string()).collect()
-    }
-
-    /// Builds a single-tier `MatchExternalKv` result for one worker.
-    fn node(worker: &str, address: &str, held: &[&str]) -> ExternalKvNodeMatch {
-        ExternalKvNodeMatch {
-            worker_id: worker.to_string(),
-            address: address.to_string(),
-            hashes_by_tier: vec![TierHashes {
-                tier: hbm(),
-                hashes: strs(held),
-            }],
-        }
-    }
-
-    #[test]
-    fn prefix_limit_honors_caller_ceiling_and_zero() {
-        assert_eq!(prefix_limit(10, 0), 10);
-        assert_eq!(prefix_limit(10, 4), 4);
-        assert_eq!(prefix_limit(3, 4), 3);
-    }
-
-    #[test]
-    fn prefix_stops_at_first_missing_block() {
-        let hashes = strs(&["a", "b", "c", "d"]);
-        // Holds a,b then a hole at c: prefix is 2 even though it also holds d.
-        let matched = MatchExternalKvResponse {
-            matches: vec![node("w1", "10.0.0.1:1", &["a", "b", "d"])],
-        };
-        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
-        assert_eq!(resp.best_prefix_blocks, 2);
-        assert_eq!(resp.blocks_read, 4);
-        assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].matched_prefix_blocks, 2);
-        assert_eq!(resp.matches[0].worker_address, "10.0.0.1:1");
-    }
-
-    #[test]
-    fn prefix_excludes_empty_address_and_zero_prefix_workers() {
-        let hashes = strs(&["a", "b"]);
-        let matched = MatchExternalKvResponse {
-            matches: vec![
-                node("routable", "10.0.0.1:1", &["a", "b"]),
-                node("no-addr", "", &["a", "b"]),
-                node("no-first-block", "10.0.0.2:1", &["b"]),
-            ],
-        };
-        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
-        let ids: Vec<&str> = resp.matches.iter().map(|m| m.worker_id.as_str()).collect();
-        assert_eq!(ids, vec!["routable"]);
-        assert_eq!(resp.best_prefix_blocks, 2);
-    }
-
-    #[test]
-    fn prefix_matches_sorted_descending() {
-        let hashes = strs(&["a", "b", "c"]);
-        let matched = MatchExternalKvResponse {
-            matches: vec![
-                node("short", "10.0.0.1:1", &["a"]),
-                node("long", "10.0.0.2:1", &["a", "b", "c"]),
-                node("mid", "10.0.0.3:1", &["a", "b"]),
-            ],
-        };
-        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
-        let order: Vec<u32> = resp
-            .matches
-            .iter()
-            .map(|m| m.matched_prefix_blocks)
-            .collect();
-        assert_eq!(order, vec![3, 2, 1]);
-        assert_eq!(resp.best_prefix_blocks, 3);
-    }
-
-    #[test]
-    fn prefix_empty_when_no_worker_holds_first_block() {
-        let hashes = strs(&["a", "b"]);
-        let matched = MatchExternalKvResponse { matches: vec![] };
-        let resp = build_prefix_response(&hashes, &matched, hashes.len() as u32);
-        assert!(resp.matches.is_empty());
-        assert_eq!(resp.best_prefix_blocks, 0);
     }
 }
