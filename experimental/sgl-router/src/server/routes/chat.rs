@@ -180,16 +180,26 @@ pub async fn chat_completions(
             } else {
                 compute_block_hashes(&tokens.ids, block_size as usize)
             };
-            if hashes.is_empty() {
-                None
+            let query_blocks = hashes.len();
+            let outcome = if hashes.is_empty() {
+                sgl_kv_indexer::PrefixOutcome::Empty
             } else {
-                let query_blocks = hashes.len();
-                Some(ExternalPrefixSignal {
-                    outcome: index.match_prefix(hashes).await,
-                    query_blocks,
-                })
-            }
+                index.match_prefix(hashes).await.map_err(|error| {
+                    tracing::warn!(model = %model_str, error = %error, "KV Indexer query failed");
+                    ApiError::PolicySelectionFailed {
+                        model: model_str.clone(),
+                    }
+                })?
+            };
+            Some(ExternalPrefixSignal {
+                outcome,
+                query_blocks,
+            })
         }
+        (Some(_), _, _) => Some(ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
+            query_blocks: 0,
+        }),
         _ => None,
     };
 

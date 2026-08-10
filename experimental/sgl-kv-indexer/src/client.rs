@@ -3,17 +3,9 @@
 
 //! Router-facing client for the prefix-match query.
 //!
-//! The index is *advisory*: the worker is the source of truth for what it holds,
-//! and a stale or unreachable index must never turn into a failed inference
-//! request. That safety property is encoded in the types here rather than left to
-//! caller discipline:
-//!
-//!   * [`PrefixOutcome`] has **no error variant**. Every failure — empty result,
-//!     unreachable endpoint, timeout, rejection — collapses into
-//!     [`PrefixOutcome::NoSignal`], so the router's only two paths are "use this
-//!     signal" or "fall back to your existing behaviour".
-//!   * The connection is established lazily, so a router does not depend on the
-//!     indexer being up at startup.
+//! A successful query distinguishes a real match from an empty result. Transport
+//! failures, deadlines, and server rejections remain errors so callers can fail
+//! the routing request instead of silently using a different signal.
 //!
 //! The surface is deliberately tiny (one trait, one method, one outcome type):
 //! the router intersects [`PrefixMatch::address`] with its own registered worker
@@ -27,9 +19,10 @@ use tonic::transport::{Channel, Endpoint};
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::MatchExternalKvPrefixRequest;
 
-/// Default per-query deadline. Kept far below the bridge's apply RPC timeout so a
-/// slow index degrades routing latency negligibly instead of stalling requests.
-pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_millis(10);
+/// Default per-query deadline. Indexer failures are request failures, so this
+/// allows normal cross-host scheduling jitter without stalling requests for an
+/// unbounded duration.
+pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_millis(100);
 
 /// One worker's contiguous prefix hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,21 +36,30 @@ pub struct PrefixMatch {
     pub worker_id: String,
 }
 
-/// Why a query produced no usable routing signal.
+/// A failed prefix query.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NoSignalReason {
-    /// No worker holds a prefix (or the request had no hashes).
-    Empty,
+pub enum PrefixIndexError {
     /// The endpoint could not be reached.
     Unreachable,
     /// The query exceeded its deadline.
     Timeout,
     /// The server rejected the request.
-    Rejected,
+    Rejected(tonic::Code),
 }
 
-/// Result of a prefix query. Deliberately has no error variant: the index is
-/// advisory, so all failures are [`NoSignal`](Self::NoSignal).
+impl std::fmt::Display for PrefixIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable => f.write_str("KV Indexer is unreachable"),
+            Self::Timeout => f.write_str("KV Indexer query timed out"),
+            Self::Rejected(code) => write!(f, "KV Indexer rejected the query with {code}"),
+        }
+    }
+}
+
+impl std::error::Error for PrefixIndexError {}
+
+/// Result of a successful prefix query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixOutcome {
     Matched {
@@ -66,7 +68,8 @@ pub enum PrefixOutcome {
         /// Longest contiguous prefix held by any single worker.
         best_prefix_blocks: u32,
     },
-    NoSignal(NoSignalReason),
+    /// No worker holds a prefix (or the request had no hashes).
+    Empty,
 }
 
 /// Client configuration.
@@ -92,14 +95,14 @@ impl PrefixIndexConfig {
 #[tonic::async_trait]
 pub trait PrefixIndex: Send + Sync {
     /// Queries the longest contiguous prefix each worker holds for `hashes`
-    /// (prompt order, `hashes[0]` first). Never fails; see [`PrefixOutcome`].
-    async fn match_prefix(&self, hashes: Vec<i64>) -> PrefixOutcome;
+    /// (prompt order, `hashes[0]` first).
+    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError>;
 }
 
 /// tonic-backed [`PrefixIndex`] with a lazily-established connection.
 pub struct GrpcPrefixIndex {
-    /// `None` when the endpoint URI could not be parsed; queries then report
-    /// [`NoSignalReason::Unreachable`] rather than failing construction.
+    /// `None` when the endpoint URI could not be parsed; queries then fail as
+    /// [`PrefixIndexError::Unreachable`].
     channel: Option<Channel>,
     deadline: Duration,
 }
@@ -118,12 +121,12 @@ impl GrpcPrefixIndex {
 
 #[tonic::async_trait]
 impl PrefixIndex for GrpcPrefixIndex {
-    async fn match_prefix(&self, hashes: Vec<i64>) -> PrefixOutcome {
+    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
         let Some(channel) = self.channel.clone() else {
-            return PrefixOutcome::NoSignal(NoSignalReason::Unreachable);
+            return Err(PrefixIndexError::Unreachable);
         };
         if hashes.is_empty() {
-            return PrefixOutcome::NoSignal(NoSignalReason::Empty);
+            return Ok(PrefixOutcome::Empty);
         }
 
         let mut client = KvIndexerClient::new(channel);
@@ -134,12 +137,12 @@ impl PrefixIndex for GrpcPrefixIndex {
         };
 
         match tokio::time::timeout(self.deadline, client.match_external_kv_prefix(request)).await {
-            Err(_) => PrefixOutcome::NoSignal(NoSignalReason::Timeout),
-            Ok(Err(status)) => PrefixOutcome::NoSignal(classify(status.code())),
+            Err(_) => Err(PrefixIndexError::Timeout),
+            Ok(Err(status)) => Err(classify(status.code())),
             Ok(Ok(response)) => {
                 let response = response.into_inner();
                 if response.matches.is_empty() {
-                    return PrefixOutcome::NoSignal(NoSignalReason::Empty);
+                    return Ok(PrefixOutcome::Empty);
                 }
                 let matches = response
                     .matches
@@ -150,18 +153,19 @@ impl PrefixIndex for GrpcPrefixIndex {
                         worker_id: m.worker_id,
                     })
                     .collect();
-                PrefixOutcome::Matched {
+                Ok(PrefixOutcome::Matched {
                     matches,
                     best_prefix_blocks: response.best_prefix_blocks,
-                }
+                })
             }
         }
     }
 }
 
-fn classify(code: tonic::Code) -> NoSignalReason {
+fn classify(code: tonic::Code) -> PrefixIndexError {
     match code {
-        tonic::Code::Unavailable => NoSignalReason::Unreachable,
-        _ => NoSignalReason::Rejected,
+        tonic::Code::Unavailable => PrefixIndexError::Unreachable,
+        tonic::Code::DeadlineExceeded => PrefixIndexError::Timeout,
+        _ => PrefixIndexError::Rejected(code),
     }
 }

@@ -3,18 +3,10 @@
 
 //! gRPC contract tests: exercise all four RPCs of the `KVIndexer` service
 //! over the wire (real tonic server + client), not just the backend trait.
-//!
-//! Like the backend integration tests these require a live store and are
-//! opt-in via `KV_INDEXER_REDIS_URL`; when it is not set every test skips. Each
-//! test uses a unique namespace and unique worker/hash ids so a shared store
-//! never causes collisions.
-#![cfg(feature = "redis-backend")]
 
-#[path = "common/require.rs"]
-mod require;
 #[path = "common/id.rs"]
 mod test_id;
-#[allow(dead_code)] // Shared fixtures include Redis-only tier helpers.
+#[allow(dead_code)]
 #[path = "common/kv.rs"]
 mod test_kv;
 #[path = "common/net.rs"]
@@ -31,13 +23,13 @@ use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
     GetExternalKvHitCountsRequest, MatchExternalKvPrefixRequest, MatchExternalKvRequest,
 };
-use sgl_kv_indexer::{KvIndexerService, RedisKvIndexerBackend};
+use sgl_kv_indexer::{InMemoryKvIndexerBackend, KvIndexerService};
 use test_id::nanos;
 use test_kv::{action, apply_request, hbm};
 use test_net::free_addr;
 
 async fn start_backend(
-    backend: RedisKvIndexerBackend,
+    backend: InMemoryKvIndexerBackend,
 ) -> KvIndexerClient<tonic::transport::Channel> {
     let svc = KvIndexerServer::new(KvIndexerService::new(backend));
     let addr = free_addr();
@@ -59,21 +51,9 @@ async fn start_backend(
     panic!("client failed to connect to {endpoint}");
 }
 
-/// Starts a real gRPC server backed by Redis on a unique namespace and returns
-/// a connected client, or `None` (skip) when no store env is configured.
-async fn start(test: &str) -> Option<KvIndexerClient<tonic::transport::Channel>> {
-    let url = match std::env::var("KV_INDEXER_REDIS_URL") {
-        Ok(u) => u,
-        Err(_) => {
-            require::skip(test, "KV_INDEXER_REDIS_URL is not set");
-            return None;
-        }
-    };
-    let ns = format!("grpc:{test}:{}", nanos());
-    let backend = RedisKvIndexerBackend::connect_single(&url, ns)
-        .await
-        .expect("connect redis");
-    Some(start_backend(backend).await)
+/// Starts a real gRPC server with isolated process-local state.
+async fn start() -> KvIndexerClient<tonic::transport::Channel> {
+    start_backend(InMemoryKvIndexerBackend::new()).await
 }
 
 fn apply(
@@ -105,24 +85,8 @@ fn apply_report(
 }
 
 #[tokio::test]
-async fn disjoint_workers_scale_across_two_indexer_servers() {
-    let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
-        require::skip(
-            "disjoint_workers_scale_across_two_indexer_servers",
-            "KV_INDEXER_REDIS_URL is not set",
-        );
-        return;
-    };
-    let namespace = format!("grpc:horizontal:{}", nanos());
-    let backend_0 = RedisKvIndexerBackend::connect_single(&url, namespace.clone())
-        .await
-        .expect("connect indexer-0 backend");
-    let backend_1 = RedisKvIndexerBackend::connect_single(&url, namespace)
-        .await
-        .expect("connect indexer-1 backend");
-    let mut indexer_0 = start_backend(backend_0).await;
-    let mut indexer_1 = start_backend(backend_1).await;
-
+async fn multiple_workers_share_one_indexer_server() {
+    let mut indexer = start().await;
     let suffix = nanos();
     let worker_0 = format!("worker-0-{suffix}");
     let worker_1 = format!("worker-1-{suffix}");
@@ -130,59 +94,47 @@ async fn disjoint_workers_scale_across_two_indexer_servers() {
     let hash_1 = format!("horizontal-h1-{suffix}");
     let shared_hash = format!("horizontal-shared-{suffix}");
 
-    let apply_0 = indexer_0.apply_external_kv_batch(apply_report(
-        &worker_0,
-        "10.0.0.1:9000",
-        1,
-        hbm(),
-        &[&hash_0, &shared_hash],
-    ));
-    let apply_1 = indexer_1.apply_external_kv_batch(apply_report(
-        &worker_1,
-        "10.0.0.2:9000",
-        1,
-        hbm(),
-        &[&hash_1, &shared_hash],
-    ));
-    let (result_0, result_1) = tokio::join!(apply_0, apply_1);
-    result_0.expect("indexer-0 applies worker-0");
-    result_1.expect("indexer-1 applies worker-1");
-
-    let request = || MatchExternalKvRequest {
-        hashes: vec![hash_0.clone(), hash_1.clone(), shared_hash.clone()],
-        count_as_hit: false,
-    };
-    let from_0 = indexer_0
-        .match_external_kv(request())
+    indexer
+        .apply_external_kv_batch(apply_report(
+            &worker_0,
+            "10.0.0.1:9000",
+            1,
+            hbm(),
+            &[&hash_0, &shared_hash],
+        ))
         .await
-        .expect("query indexer-0")
-        .into_inner();
-    let from_1 = indexer_1
-        .match_external_kv(request())
+        .expect("apply worker-0");
+    indexer
+        .apply_external_kv_batch(apply_report(
+            &worker_1,
+            "10.0.0.2:9000",
+            1,
+            hbm(),
+            &[&hash_1, &shared_hash],
+        ))
         .await
-        .expect("query indexer-1")
-        .into_inner();
+        .expect("apply worker-1");
 
-    for response in [&from_0, &from_1] {
-        assert!(
-            response
-                .matches
-                .iter()
-                .any(|entry| entry.worker_id == worker_0),
-            "either indexer must see worker-0 through shared Redis"
-        );
-        assert!(
-            response
-                .matches
-                .iter()
-                .any(|entry| entry.worker_id == worker_1),
-            "either indexer must see worker-1 through shared Redis"
-        );
-    }
+    let response = indexer
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![hash_0.clone(), hash_1.clone(), shared_hash.clone()],
+            count_as_hit: false,
+        })
+        .await
+        .expect("query indexer")
+        .into_inner();
+    assert!(response
+        .matches
+        .iter()
+        .any(|entry| entry.worker_id == worker_0));
+    assert!(response
+        .matches
+        .iter()
+        .any(|entry| entry.worker_id == worker_1));
 
     // Keep one wire-level smoke check for hit counting; detailed counter
-    // semantics live in redis_integration.rs.
-    indexer_0
+    // semantics live in memory_integration.rs.
+    indexer
         .match_external_kv(MatchExternalKvRequest {
             hashes: vec![hash_0.clone()],
             count_as_hit: true,
@@ -190,7 +142,7 @@ async fn disjoint_workers_scale_across_two_indexer_servers() {
         .await
         .expect("counting match over gRPC");
     let miss = format!("horizontal-miss-{suffix}");
-    let counts = indexer_1
+    let counts = indexer
         .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
             hashes: vec![hash_0.clone(), miss.clone()],
         })
@@ -211,9 +163,7 @@ async fn disjoint_workers_scale_across_two_indexer_servers() {
 
 #[tokio::test]
 async fn validation_errors_map_to_invalid_argument_over_grpc() {
-    let Some(mut c) = start("validation").await else {
-        return;
-    };
+    let mut c = start().await;
 
     // empty worker_id
     let err = c
@@ -289,9 +239,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
 
 #[tokio::test]
 async fn match_prefix_over_grpc() {
-    let Some(mut c) = start("match_prefix").await else {
-        return;
-    };
+    let mut c = start().await;
     let (w_long, w_short) = (format!("long-{}", nanos()), format!("short-{}", nanos()));
     let (a, b, d) = ("mp-a", "mp-b", "mp-c");
 
