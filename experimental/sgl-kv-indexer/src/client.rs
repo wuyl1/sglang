@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tonic::transport::{Channel, Endpoint};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
@@ -23,6 +24,8 @@ use crate::pb::MatchExternalKvPrefixRequest;
 /// allows normal cross-host scheduling jitter without stalling requests for an
 /// unbounded duration.
 pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_millis(100);
+/// Default process-local bound on prefix-query RPCs issued by one client.
+pub const DEFAULT_QUERY_MAX_INFLIGHT: usize = 32;
 
 /// One worker's contiguous prefix hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,8 @@ pub enum PrefixIndexError {
     Unreachable,
     /// The query exceeded its deadline.
     Timeout,
+    /// The client or Indexer shed the query because its in-flight limit was hit.
+    Overloaded,
     /// The server rejected the request.
     Rejected(tonic::Code),
 }
@@ -52,6 +57,7 @@ impl std::fmt::Display for PrefixIndexError {
         match self {
             Self::Unreachable => f.write_str("KV Indexer is unreachable"),
             Self::Timeout => f.write_str("KV Indexer query timed out"),
+            Self::Overloaded => f.write_str("KV Indexer is overloaded"),
             Self::Rejected(code) => write!(f, "KV Indexer rejected the query with {code}"),
         }
     }
@@ -105,17 +111,34 @@ pub struct GrpcPrefixIndex {
     /// [`PrefixIndexError::Unreachable`].
     channel: Option<Channel>,
     deadline: Duration,
+    prefix_query_semaphore: Semaphore,
 }
 
 impl GrpcPrefixIndex {
     pub fn new(config: PrefixIndexConfig) -> Self {
+        Self::with_max_inflight(config, DEFAULT_QUERY_MAX_INFLIGHT)
+    }
+
+    /// Constructs a client with an explicit local admission limit.
+    pub fn with_max_inflight(config: PrefixIndexConfig, max_inflight: usize) -> Self {
+        assert!(
+            max_inflight > 0,
+            "prefix query max inflight must be greater than zero"
+        );
         let channel = Endpoint::from_shared(config.endpoint)
             .ok()
             .map(|endpoint| endpoint.connect_lazy());
         Self {
             channel,
             deadline: config.query_deadline,
+            prefix_query_semaphore: Semaphore::new(max_inflight),
         }
+    }
+
+    fn try_acquire_prefix_query(&self) -> Result<SemaphorePermit<'_>, PrefixIndexError> {
+        self.prefix_query_semaphore
+            .try_acquire()
+            .map_err(|_| PrefixIndexError::Overloaded)
     }
 }
 
@@ -128,13 +151,18 @@ impl PrefixIndex for GrpcPrefixIndex {
         if hashes.is_empty() {
             return Ok(PrefixOutcome::Empty);
         }
+        let _permit = self.try_acquire_prefix_query()?;
 
         let mut client = KvIndexerClient::new(channel);
-        let request = MatchExternalKvPrefixRequest {
+        let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
             // The bridge encodes block hashes as decimal strings; mirror it.
             hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
             max_blocks: 0,
-        };
+        });
+        // On the wire so the indexer can drop a query this caller already stopped
+        // waiting for. The local timeout below stays the hard stop, since it also
+        // covers a stall before the channel applies its own deadline.
+        request.set_timeout(self.deadline);
 
         match tokio::time::timeout(self.deadline, client.match_external_kv_prefix(request)).await {
             Err(_) => Err(PrefixIndexError::Timeout),
@@ -165,7 +193,51 @@ impl PrefixIndex for GrpcPrefixIndex {
 fn classify(code: tonic::Code) -> PrefixIndexError {
     match code {
         tonic::Code::Unavailable => PrefixIndexError::Unreachable,
-        tonic::Code::DeadlineExceeded => PrefixIndexError::Timeout,
+        // The indexer sheds an expired query as DEADLINE_EXCEEDED, while tonic
+        // reports its own enforcement of the same `grpc-timeout` as CANCELLED.
+        // This client cancels a query for no other reason.
+        tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => PrefixIndexError::Timeout,
+        tonic::Code::ResourceExhausted => PrefixIndexError::Overloaded,
         _ => PrefixIndexError::Rejected(code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_resource_exhausted_as_overload() {
+        assert_eq!(
+            classify(tonic::Code::ResourceExhausted),
+            PrefixIndexError::Overloaded
+        );
+    }
+
+    #[test]
+    fn classifies_both_deadline_signals_as_timeout() {
+        for code in [tonic::Code::DeadlineExceeded, tonic::Code::Cancelled] {
+            assert_eq!(classify(code), PrefixIndexError::Timeout);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_admission_rejects_without_queueing() {
+        let index = GrpcPrefixIndex::with_max_inflight(
+            PrefixIndexConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                query_deadline: DEFAULT_QUERY_DEADLINE,
+            },
+            1,
+        );
+
+        let permit = index.try_acquire_prefix_query().unwrap();
+        assert_eq!(
+            index.try_acquire_prefix_query().unwrap_err(),
+            PrefixIndexError::Overloaded
+        );
+
+        drop(permit);
+        assert!(index.try_acquire_prefix_query().is_ok());
     }
 }

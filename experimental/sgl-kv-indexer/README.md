@@ -82,8 +82,11 @@ KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
   cargo run --release --bin kv-indexer-server
 ```
 
-`KV_INDEXER_LISTEN_ADDR` defaults to `[::1]:50051`. There is no backend or
-storage configuration.
+`KV_INDEXER_LISTEN_ADDR` defaults to `[::1]:50051`.
+`KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` sets the maximum number of prefix
+queries executing concurrently and defaults to `32`. Requests above the limit
+are rejected immediately with gRPC `RESOURCE_EXHAUSTED`.
+There is no backend or storage configuration.
 
 2. Start one bridge per worker event stream. This FULL+SWA example uses the
 worker URL registered with the Router:

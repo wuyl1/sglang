@@ -52,7 +52,7 @@ struct WorkerView {
     worker_id: String,
     address: String,
     spec: Option<WorkerCacheSpec>,
-    hashes_by_tier: BTreeMap<i32, Vec<String>>,
+    hashes_by_tier: BTreeMap<i32, Vec<(String, u32, u32)>>,
     blocks: Vec<Option<BlockComponents>>,
 }
 
@@ -163,9 +163,19 @@ impl InMemoryKvIndexerBackend {
     }
 
     fn do_match(&self, req: MatchExternalKvRequest) -> Result<MatchExternalKvResponse, Status> {
-        let mut state = self.write_state()?;
         let hashes = dedup_preserve_order(&req.hashes);
-        let (workers, matched_hashes) = Self::collect_worker_views(&state, &hashes, false);
+        let workers = if req.count_as_hit {
+            let mut state = self.write_state()?;
+            let (workers, matched_hashes) = Self::collect_worker_views(&state, &hashes, false);
+            for hash in matched_hashes {
+                let count = state.hit_counts.entry(hash).or_default();
+                *count = count.saturating_add(1);
+            }
+            workers
+        } else {
+            let state = self.read_state()?;
+            Self::collect_worker_views(&state, &hashes, false).0
+        };
         let matches = workers
             .into_iter()
             .map(|worker| ExternalKvNodeMatch {
@@ -174,17 +184,18 @@ impl InMemoryKvIndexerBackend {
                 hashes_by_tier: worker
                     .hashes_by_tier
                     .into_iter()
-                    .map(|(tier, hashes)| TierHashes { tier, hashes })
+                    .map(|(tier, placements)| TierHashes {
+                        tier,
+                        hashes: placements.iter().map(|(hash, _, _)| hash.clone()).collect(),
+                        component_masks: placements.iter().map(|(_, mask, _)| *mask).collect(),
+                        block_sizes: placements
+                            .into_iter()
+                            .map(|(_, _, block_size)| block_size)
+                            .collect(),
+                    })
                     .collect(),
             })
             .collect();
-
-        if req.count_as_hit {
-            for hash in matched_hashes {
-                let count = state.hit_counts.entry(hash).or_default();
-                *count = count.saturating_add(1);
-            }
-        }
 
         Ok(MatchExternalKvResponse { matches })
     }
@@ -194,8 +205,11 @@ impl InMemoryKvIndexerBackend {
         hashes: &[String],
         with_blocks: bool,
     ) -> (Vec<WorkerView>, Vec<String>) {
-        let mut worker_order = Vec::new();
-        let mut by_worker: HashMap<String, WorkerView> = HashMap::new();
+        // Keyed by a borrow of the stored worker id, which is copied once per
+        // worker in the result instead of once per scanned `(block, worker)`
+        // placement — a 512-block query over 15 workers walks 7,680 of those.
+        let mut worker_order: Vec<&str> = Vec::new();
+        let mut by_worker: HashMap<&str, WorkerView> = HashMap::new();
         let mut matched_hashes = Vec::new();
 
         for (index, hash) in hashes.iter().enumerate() {
@@ -207,8 +221,8 @@ impl InMemoryKvIndexerBackend {
             }
             matched_hashes.push(hash.clone());
             for ((worker, tier), mask) in &block.placements {
-                let view = by_worker.entry(worker.clone()).or_insert_with(|| {
-                    worker_order.push(worker.clone());
+                let view = by_worker.entry(worker.as_str()).or_insert_with(|| {
+                    worker_order.push(worker.as_str());
                     let metadata = state.workers.get(worker);
                     WorkerView {
                         worker_id: worker.clone(),
@@ -231,17 +245,18 @@ impl InMemoryKvIndexerBackend {
                     });
                     components.tier_masks.push((*tier, *mask));
                 } else {
-                    view.hashes_by_tier
-                        .entry(*tier)
-                        .or_default()
-                        .push(hash.clone());
+                    view.hashes_by_tier.entry(*tier).or_default().push((
+                        hash.clone(),
+                        *mask,
+                        block.token_count,
+                    ));
                 }
             }
         }
 
         let workers = worker_order
             .into_iter()
-            .filter_map(|worker| by_worker.remove(&worker))
+            .filter_map(|worker| by_worker.remove(worker))
             .collect();
         (workers, matched_hashes)
     }
@@ -263,24 +278,26 @@ impl InMemoryKvIndexerBackend {
         &self,
         req: MatchExternalKvPrefixRequest,
     ) -> Result<MatchExternalKvPrefixResponse, Status> {
-        let state = self.read_state()?;
         let limit = prefix_limit(req.hashes.len(), req.max_blocks).min(PREFIX_SCAN_CAP);
         let hashes = &req.hashes[..limit];
         if hashes.is_empty() {
             return Ok(MatchExternalKvPrefixResponse::default());
         }
-        if state
-            .blocks
-            .get(&hashes[0])
-            .is_none_or(|block| block.placements.is_empty())
-        {
-            return Ok(MatchExternalKvPrefixResponse {
-                matches: Vec::new(),
-                best_prefix_blocks: 0,
-                blocks_read: 1,
-            });
-        }
-        let inputs = Self::collect_prefix_inputs_locked(&state, hashes);
+        let inputs = {
+            let state = self.read_state()?;
+            if state
+                .blocks
+                .get(&hashes[0])
+                .is_none_or(|block| block.placements.is_empty())
+            {
+                return Ok(MatchExternalKvPrefixResponse {
+                    matches: Vec::new(),
+                    best_prefix_blocks: 0,
+                    blocks_read: 1,
+                });
+            }
+            Self::collect_prefix_inputs_locked(&state, hashes)
+        };
         Ok(compute_prefix_response(&inputs, limit as u32))
     }
 
@@ -379,10 +396,36 @@ impl KvIndexerBackend for InMemoryKvIndexerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
 
     #[test]
     fn dedup_keeps_first_seen_order() {
         let hashes = vec!["a".into(), "b".into(), "a".into(), "c".into()];
         assert_eq!(dedup_preserve_order(&hashes), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn match_without_hit_count_uses_shared_lock() {
+        let backend = Arc::new(InMemoryKvIndexerBackend::new());
+        let read_guard = backend.read_state().unwrap();
+        let query_backend = Arc::clone(&backend);
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let query = std::thread::spawn(move || {
+            result_tx
+                .send(query_backend.do_match(MatchExternalKvRequest {
+                    hashes: vec!["a".into()],
+                    count_as_hit: false,
+                }))
+                .unwrap();
+        });
+
+        result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("read-only match should not wait for another reader")
+            .unwrap();
+        drop(read_guard);
+        query.join().unwrap();
     }
 }

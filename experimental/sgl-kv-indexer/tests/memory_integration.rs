@@ -829,6 +829,18 @@ async fn partial_eviction_replace_shrinks_component_set() {
         .await
         .unwrap();
     assert_eq!(after.best_prefix_blocks, 1);
+
+    let snapshot = b
+        .match_external_kv(match_req(&["a", "b"], false))
+        .await
+        .unwrap();
+    let tier = &snapshot.matches[0].hashes_by_tier[0];
+    assert_eq!(tier.hashes, vec!["a", "b"]);
+    assert_eq!(
+        tier.component_masks,
+        vec![COMPONENT_FULL | COMPONENT_SWA, COMPONENT_FULL]
+    );
+    assert_eq!(tier.block_sizes, vec![80, 80]);
 }
 
 #[tokio::test]

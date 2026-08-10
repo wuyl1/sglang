@@ -184,12 +184,7 @@ pub async fn chat_completions(
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
             } else {
-                index.match_prefix(hashes).await.map_err(|error| {
-                    tracing::warn!(model = %model_str, error = %error, "KV Indexer query failed");
-                    ApiError::PolicySelectionFailed {
-                        model: model_str.clone(),
-                    }
-                })?
+                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
             };
             Some(ExternalPrefixSignal {
                 outcome,
@@ -656,6 +651,25 @@ pub async fn chat_completions(
     }
 }
 
+fn resolve_prefix_query(
+    result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
+    model: &str,
+) -> Result<sgl_kv_indexer::PrefixOutcome, ApiError> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(sgl_kv_indexer::PrefixIndexError::Overloaded) => {
+            tracing::warn!(%model, "KV Indexer overloaded; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
+        Err(error) => {
+            tracing::warn!(%model, error = %error, "KV Indexer query failed");
+            Err(ApiError::PolicySelectionFailed {
+                model: model.to_string(),
+            })
+        }
+    }
+}
+
 /// Estimate prefill-token count from the raw request body for use as
 /// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
@@ -946,6 +960,23 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexer_overload_degrades_to_empty_prefix_signal() {
+        assert_eq!(
+            resolve_prefix_query(Err(sgl_kv_indexer::PrefixIndexError::Overloaded), "tiny")
+                .unwrap(),
+            sgl_kv_indexer::PrefixOutcome::Empty
+        );
+    }
+
+    #[test]
+    fn non_overload_indexer_error_still_fails_selection() {
+        assert!(matches!(
+            resolve_prefix_query(Err(sgl_kv_indexer::PrefixIndexError::Unreachable), "tiny"),
+            Err(ApiError::PolicySelectionFailed { .. })
+        ));
+    }
 
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
     /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64

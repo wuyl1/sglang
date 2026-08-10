@@ -12,18 +12,23 @@ mod test_kv;
 #[path = "common/net.rs"]
 mod test_net;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tonic::transport::Server;
-use tonic::Code;
+use tonic::{Code, Status};
 
 use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvPrefixRequest, MatchExternalKvRequest,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
+    ExternalKvActionType, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
+    MatchExternalKvResponse,
 };
-use sgl_kv_indexer::{InMemoryKvIndexerBackend, KvIndexerService};
+use sgl_kv_indexer::{InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService};
 use test_id::nanos;
 use test_kv::{action, apply_request, hbm};
 use test_net::free_addr;
@@ -51,9 +56,127 @@ async fn start_backend(
     panic!("client failed to connect to {endpoint}");
 }
 
+#[derive(Clone)]
+struct BlockingPrefixBackend {
+    entered: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+#[tonic::async_trait]
+impl KvIndexerBackend for BlockingPrefixBackend {
+    async fn apply_external_kv_batch(
+        &self,
+        _request: ApplyExternalKvBatchRequest,
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
+        Ok(ApplyExternalKvBatchResponse::default())
+    }
+
+    async fn match_external_kv(
+        &self,
+        _request: MatchExternalKvRequest,
+    ) -> Result<MatchExternalKvResponse, Status> {
+        Ok(MatchExternalKvResponse::default())
+    }
+
+    async fn match_external_kv_prefix(
+        &self,
+        _request: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let _permit = self.release.acquire().await.expect("semaphore open");
+        Ok(MatchExternalKvPrefixResponse::default())
+    }
+
+    async fn get_external_kv_hit_counts(
+        &self,
+        _request: GetExternalKvHitCountsRequest,
+    ) -> Result<GetExternalKvHitCountsResponse, Status> {
+        Ok(GetExternalKvHitCountsResponse::default())
+    }
+}
+
+async fn start_blocking_backend(
+    backend: BlockingPrefixBackend,
+) -> KvIndexerClient<tonic::transport::Channel> {
+    let svc = KvIndexerServer::new(KvIndexerService::with_prefix_query_max_inflight(backend, 2));
+    let addr = free_addr();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve(addr)
+            .await
+            .expect("server serve");
+    });
+
+    let endpoint = format!("http://{addr}");
+    for _ in 0..50 {
+        if let Ok(client) = KvIndexerClient::connect(endpoint.clone()).await {
+            return client;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("client failed to connect to {endpoint}");
+}
+
 /// Starts a real gRPC server with isolated process-local state.
 async fn start() -> KvIndexerClient<tonic::transport::Channel> {
     start_backend(InMemoryKvIndexerBackend::new()).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_limit_rejects_over_real_grpc_without_blocking_writes() {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let backend = BlockingPrefixBackend {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    let client = start_blocking_backend(backend).await;
+    let request = || MatchExternalKvPrefixRequest {
+        hashes: vec!["hash".into()],
+        max_blocks: 0,
+    };
+
+    let mut first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.match_external_kv_prefix(request()).await });
+    let mut second_client = client.clone();
+    let second =
+        tokio::spawn(async move { second_client.match_external_kv_prefix(request()).await });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while entered.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two prefix queries should enter the backend");
+
+    let mut rejected_client = client.clone();
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(1),
+        rejected_client.match_external_kv_prefix(request()),
+    )
+    .await
+    .expect("overload response should be immediate")
+    .expect_err("third prefix query should be rejected");
+    assert_eq!(rejected.code(), Code::ResourceExhausted);
+    assert_eq!(entered.load(Ordering::SeqCst), 2);
+
+    let mut write_client = client.clone();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        write_client.apply_external_kv_batch(ApplyExternalKvBatchRequest {
+            worker_id: "worker".into(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("writes should not share the prefix-query limit")
+    .expect("write should succeed");
+
+    release.add_permits(2);
+    first.await.expect("first task").expect("first response");
+    second.await.expect("second task").expect("second response");
 }
 
 fn apply(

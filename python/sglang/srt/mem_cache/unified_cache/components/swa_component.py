@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -462,6 +463,7 @@ class SWAComponent(TreeComponent):
             self.tree_core._cascade_evict(
                 x, self, tracker, device_frees=device_frees, host_frees=host_frees
             )
+            self.tree_core._restate_component_placement(x, StorageMedium.GPU)
             self._evict_device_cursor = x_next
         return None
 
@@ -614,6 +616,9 @@ class SWAComponent(TreeComponent):
                         target=EvictLayer.DEVICE,
                         device_frees=device_frees,
                         host_frees=host_frees,
+                    )
+                    self.tree_core._restate_component_placement(
+                        cur, StorageMedium.GPU
                     )
 
             if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
@@ -962,6 +967,7 @@ class SWAComponent(TreeComponent):
                     host_frees=host_frees,
                     target=EvictLayer.HOST,
                 )
+                self.tree_core._restate_component_placement(x, StorageMedium.CPU)
             x = x_next
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
