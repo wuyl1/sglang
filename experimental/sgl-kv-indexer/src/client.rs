@@ -120,7 +120,12 @@ impl GrpcPrefixIndex {
     }
 
     /// Constructs a client with an explicit local admission limit.
-    pub fn with_max_inflight(config: PrefixIndexConfig, max_inflight: usize) -> Self {
+    ///
+    /// Not public: the limit is a safety valve sized well above the query rate a
+    /// router can reach within its own deadline, not a tuning knob. Exposing it
+    /// would imply a deployment can raise its way out of overload, when the
+    /// binding constraint is the indexer's capacity rather than this ceiling.
+    fn with_max_inflight(config: PrefixIndexConfig, max_inflight: usize) -> Self {
         assert!(
             max_inflight > 0,
             "prefix query max inflight must be greater than zero"

@@ -1065,7 +1065,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         been applied by the orchestrator. That ordering is guaranteed because none
         of those actions is in ``_is_deferrable_action``, so each forces a barrier
         suspend -> apply -> resume before TAIL; thus each node's snapshot reflects
-        its final SWA/Mamba placement (see test_aux_commit_actions_are_not_deferrable).
+        its final SWA/Mamba placement. That invariant is pinned by
+        ``test_kv_events_component_types.test_aux_commit_actions_are_not_deferrable``.
 
         Covers (a) nodes noted during the walk/commit and (b) the new-suffix chain
         from the leaf up to the insert parent (leaf + any SWA-split tombstone

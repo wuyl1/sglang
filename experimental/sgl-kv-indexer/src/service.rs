@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
-use crate::admission::reject_if_deadline_passed;
+use crate::admission::{reject_if_deadline_passed, RejectionLog};
 use crate::pb::kv_indexer_server::KvIndexer;
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
@@ -15,19 +15,21 @@ use crate::pb::{
     MatchExternalKvRequest, MatchExternalKvResponse, TierType, WorkerCacheSpec,
 };
 
-/// Protocol-level resource bounds. The Redis backend additionally chunks its
-/// fan-out, but rejecting oversized requests here prevents any backend from
-/// allocating or scheduling work proportional to an unbounded repeated field.
+/// Protocol-level resource bounds, enforced before a backend sees the request so
+/// no caller can make one allocate or schedule work proportional to an unbounded
+/// repeated field.
 const MAX_HASHES_PER_REQUEST: usize = 16_384;
 const MAX_ACTIONS_PER_BATCH: usize = 256;
 pub const DEFAULT_PREFIX_QUERY_MAX_INFLIGHT: usize = 32;
 
+static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
+
 /// Storage backend for the indexer. Deliberately narrow: every mutation flows
 /// through `apply_external_kv_batch`, preserving one ordered write path.
 ///
-/// Async because real backends (e.g. Redis) do network IO; the trait is made
-/// dyn-safe via `#[tonic::async_trait]` so the server can select a backend at
-/// runtime and hold it as `Arc<dyn KvIndexerBackend>`.
+/// Async so a backend that does IO fits without reshaping the trait, even though
+/// this build's is process-local. Made dyn-safe via `#[tonic::async_trait]` so the
+/// server can select a backend at runtime and hold it as `Arc<dyn KvIndexerBackend>`.
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
@@ -189,10 +191,15 @@ where
         validate_hashes(&request.hashes)?;
         // Bounds a backend that holds this permit across IO; see `admission` for
         // why that cannot observe a process-local one.
-        let _permit = self
-            .prefix_query_semaphore
-            .try_acquire()
-            .map_err(|_| Status::resource_exhausted("too many in-flight prefix queries"))?;
+        let _permit = self.prefix_query_semaphore.try_acquire().map_err(|_| {
+            if let Some(rejected_total) = OVERLOAD_LOG.record() {
+                tracing::warn!(
+                    rejected_total,
+                    "rejecting prefix query: too many in-flight prefix queries"
+                );
+            }
+            Status::resource_exhausted("too many in-flight prefix queries")
+        })?;
         let response = self.backend.match_external_kv_prefix(request).await?;
         Ok(Response::new(response))
     }
@@ -527,9 +534,9 @@ fn component_available(
 }
 
 /// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds
-/// the response. Shared so the Redis fast path, which computes prefixes during
-/// its scan, produces byte-identical shape to the default implementation.
-pub(crate) fn assemble_prefix_response(
+/// the response, so `best_prefix_blocks` and the match order are derived in one
+/// place rather than per caller.
+fn assemble_prefix_response(
     mut entries: Vec<(String, String, u32)>,
     blocks_read: u32,
 ) -> MatchExternalKvPrefixResponse {

@@ -122,8 +122,9 @@ impl InMemoryKvIndexerBackend {
                         block
                             .placements
                             .insert((worker_id.clone(), action.tier), mask);
-                        // Match the Redis backend: a legacy report does not
-                        // overwrite an already known positive token count.
+                        // A legacy report carries no size, so 0 means "unknown"
+                        // and must not erase a count a component-aware report
+                        // already established for this block.
                         if token_count > 0 {
                             block.token_count = token_count;
                         }

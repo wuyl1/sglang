@@ -3,17 +3,19 @@
 
 //! Deadline-based load shedding for the query path.
 //!
-//! A concurrency limit only measures overload for a backend that yields: Redis
-//! holds its permit across network IO, whereas a process-local backend returns
-//! its permit before the next request is even decoded, so the limit stays far
-//! from its ceiling while requests pile up in the runtime instead. What is
-//! observable in both cases is how long a request waited to reach its handler.
+//! A concurrency limit only measures overload for a backend that yields: one
+//! doing IO holds its permit across the wait, whereas this build's process-local
+//! backend returns its permit before the next request is even decoded, so the
+//! limit stays far from its ceiling while requests pile up in the runtime
+//! instead. What is observable in both cases is how long a request waited to
+//! reach its handler.
 //!
 //! Once that wait has consumed the caller's whole deadline the answer can no
 //! longer be read, so computing it only pushes the backlog further behind. The
 //! budget is the caller's own `grpc-timeout`, which leaves no server-side
 //! threshold to tune and never sheds a caller that declared no deadline.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tonic::metadata::MetadataMap;
@@ -22,6 +24,30 @@ use tonic::{Extensions, Request, Status};
 /// When the request's headers were read off the connection.
 #[derive(Clone, Copy)]
 struct Arrival(Instant);
+
+/// Counts rejections of one kind and picks which ones to log.
+///
+/// Overload is a rate, not an event. Logging every rejection adds load exactly
+/// when the service is shedding to get rid of some, while logging none leaves an
+/// operator unable to tell shedding apart from ordinary latency. Reporting on
+/// doubling counts keeps the first rejection immediate and the volume
+/// logarithmic in a sustained overload.
+pub(crate) struct RejectionLog(AtomicU64);
+
+impl RejectionLog {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Records one rejection, returning the running total when it should be
+    /// logged and `None` when it should be absorbed.
+    pub(crate) fn record(&self) -> Option<u64> {
+        let total = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+        total.is_power_of_two().then_some(total)
+    }
+}
+
+static DEADLINE_SHED_LOG: RejectionLog = RejectionLog::new();
 
 /// Server interceptor that timestamps a request's arrival, so the query path can
 /// measure how long it then waited to be served.
@@ -51,11 +77,14 @@ pub(crate) fn reject_if_deadline_passed(
     if waited < budget {
         return Ok(());
     }
-    tracing::debug!(
-        waited_ms = waited.as_millis(),
-        budget_ms = budget.as_millis(),
-        "shedding prefix query whose caller deadline already passed"
-    );
+    if let Some(shed_total) = DEADLINE_SHED_LOG.record() {
+        tracing::info!(
+            shed_total,
+            waited_ms = waited.as_millis(),
+            budget_ms = budget.as_millis(),
+            "shedding prefix query whose caller deadline already passed"
+        );
+    }
     Err(Status::deadline_exceeded(
         "prefix query waited longer than its caller deadline",
     ))
@@ -139,6 +168,15 @@ mod tests {
         assert!(
             reject_if_deadline_passed(&metadata(Some("100m")), &extensions(Some(within))).is_ok()
         );
+    }
+
+    #[test]
+    fn rejections_are_reported_on_doubling_counts() {
+        let log = RejectionLog::new();
+        let reported: Vec<u64> = (0..16).filter_map(|_| log.record()).collect();
+        // The first rejection is always reported, and the gaps then double, so a
+        // sustained overload cannot flood the log.
+        assert_eq!(reported, vec![1, 2, 4, 8, 16]);
     }
 
     #[test]

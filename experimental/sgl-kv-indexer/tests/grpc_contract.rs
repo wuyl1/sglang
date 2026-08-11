@@ -13,7 +13,7 @@ mod test_kv;
 mod test_net;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -28,7 +28,10 @@ use sgl_kv_indexer::pb::{
     MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
     MatchExternalKvResponse,
 };
-use sgl_kv_indexer::{InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService};
+use sgl_kv_indexer::{
+    GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService, PrefixIndex,
+    PrefixIndexConfig,
+};
 use test_id::nanos;
 use test_kv::{action, apply_request, hbm};
 use test_net::free_addr;
@@ -391,4 +394,82 @@ async fn match_prefix_over_grpc() {
     assert_eq!(resp.matches[0].worker_address, "10.0.0.1:9000");
     assert_eq!(resp.matches[1].worker_id, w_short);
     assert_eq!(resp.matches[1].matched_prefix_blocks, 1);
+}
+
+/// Serves an empty backend behind an interceptor that records the `grpc-timeout`
+/// of every request, and returns the router-facing client alongside the capture.
+async fn start_recording_deadlines(
+    query_deadline: Duration,
+) -> (GrpcPrefixIndex, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let svc = KvIndexerServer::with_interceptor(
+        KvIndexerService::new(InMemoryKvIndexerBackend::new()),
+        move |request: tonic::Request<()>| {
+            if let Some(timeout) = request.metadata().get("grpc-timeout") {
+                recorder
+                    .lock()
+                    .expect("deadline recorder")
+                    .push(timeout.to_str().expect("ascii timeout").to_string());
+            }
+            Ok(request)
+        },
+    );
+    let addr = free_addr();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve(addr)
+            .await
+            .expect("server serve");
+    });
+
+    let endpoint = format!("http://{addr}");
+    for _ in 0..50 {
+        if KvIndexerClient::connect(endpoint.clone()).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let index = GrpcPrefixIndex::new(PrefixIndexConfig {
+        endpoint,
+        query_deadline,
+    });
+    (index, seen)
+}
+
+/// The router-facing client must publish its deadline on the wire, since that
+/// header is the only thing letting the indexer shed a query whose caller has
+/// already given up. Nothing else in the suite covers `GrpcPrefixIndex` itself,
+/// so without this the header could be dropped silently.
+#[tokio::test]
+async fn router_client_publishes_its_deadline_on_the_wire() {
+    let (index, seen) = start_recording_deadlines(Duration::from_millis(250)).await;
+
+    index
+        .match_prefix(vec![1, 2, 3])
+        .await
+        .expect("query reaches the indexer");
+
+    let seen = seen.lock().expect("deadline recorder").clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly one query reached the server: {seen:?}"
+    );
+    let raw = &seen[0];
+    // Asserted structurally rather than byte-for-byte: the wire spec lets the
+    // sender pick any unit that fits, so pinning tonic's current choice would
+    // make this fail on an encoding change that is still correct.
+    let (digits, unit) = raw.split_at(raw.len() - 1);
+    assert!(
+        matches!(unit, "H" | "M" | "S" | "m" | "u" | "n"),
+        "unit is one the wire spec defines: {raw:?}"
+    );
+    let value: u64 = digits.parse().expect("timeout value is numeric");
+    assert!(
+        value > 0,
+        "a budget of zero would shed every query: {raw:?}"
+    );
 }
