@@ -20,19 +20,18 @@ KV Indexer 是内存软状态，下面四类故障会让索引与 Worker 的真�
 ```text
 获取 Publisher 全量 Snapshot
   -> 通过现有 ApplyExternalKvBatch 按序应用 CLEAR + REPORT
-  -> 全部成功后推进 cursor
+  -> 全部成功后推进已应用序号
   -> 应用 Snapshot 之后的实时事件
 ```
 
-触发条件：
+四类故障各自靠什么信号发现：
 
-| 场景 | 触发 |
+| 故障 | 检测信号 |
 | --- | --- |
 | Indexer 重启 | Bridge 建立新的 gRPC 连接 |
-| Bridge 重启 | Bridge 启动时 cursor 为空 |
+| Bridge 重启 | Bridge 启动时没有已应用序号 |
 | Worker 重启 | 首条 CLEAR 或 seq 回退 |
 | ZMQ 丢事件 | seq gap 或事件解码失败 |
-| 没有异常信号的漂移 | 每 10 分钟周期恢复 |
 
 ### Snapshot 契约
 
@@ -60,25 +59,25 @@ Publisher 必须原子复制 placement mirror 和 `last_seq`。幂等 apply 解�
 
 ### Bridge 行为
 
-Bridge 在内存中维护已成功应用的最大 seq：
+Bridge 在内存中维护一个**已应用序号**，即已经确认写入 Indexer 的最大 seq。它既用来判断队列里哪些事件是多余的，也是检测 seq gap 和 seq 回退的基准。
 
 ```text
 获取 Snapshot
   -> 按序应用全部分片
-  -> cursor = last_seq
-  -> 丢弃 buffered seq <= cursor
-  -> 按序应用 buffered seq > cursor
+  -> 已应用序号 = last_seq
+  -> 丢弃队列中 seq <= 已应用序号 的事件
+  -> 按序应用队列中 seq > 已应用序号 的事件
 ```
 
 必须满足：
 
 - 单 writer、严格按序、同一时刻只有一个在途 apply；
 - ZMQ 订阅与 Indexer 写入使用两个任务，中间通过有界队列连接，避免慢 apply 阻塞 ZMQ 接收；
-- `received_seq` 小于期望值一律按 Worker 重启处理并触发恢复，这条判断必须先于“丢弃 seq <= cursor”，否则重启后 seq 归零的事件会被当成旧事件全部丢弃；
+- `received_seq` 小于期望值一律按 Worker 重启处理并触发恢复，这条判断必须先于“丢弃 seq <= 已应用序号”，否则重启后 seq 归零的事件会被当成旧事件全部丢弃；
 - Snapshot 查询失败时保留当前索引并退避重试，不清空、不退出；
-- Snapshot 已部分应用时不推进 cursor，从 CLEAR 开始重试完整 Snapshot，期间索引停在空或部分状态，只影响命中率；
+- Snapshot 已部分应用时不推进已应用序号，从 CLEAR 开始重试完整 Snapshot，期间索引停在空或部分状态，只影响命中率；
 - 普通实时 batch 的分片失败只重试该分片；
-- 重试与重连使用 full jitter 退避，避免 Indexer 重启后所有 Bridge 同时全量恢复。
+- 重试与重连使用 full jitter，避免 Indexer 重启后所有 Bridge 同时全量恢复。
 
 队列满时主动触发恢复。队列容量至少覆盖一次恢复期间产生的事件：
 
@@ -101,11 +100,13 @@ Publisher：
 Bridge：
 
 1. 解耦 ZMQ 订阅与 Indexer 写入；
-2. 跟踪 seq 和 cursor；
-3. 在启动、重连、gap、回退、解码失败和周期到期时恢复；
+2. 跟踪 seq 和已应用序号；
+3. 在启动、重连、gap、回退和解码失败时恢复；
 4. 正确处理 Snapshot 中途失败。
 
-首版不修改 Indexer 数据结构、现有 apply proto 和 Router，也不增加 WAL、staging、readiness gate、publisher epoch、lease 或短 gap replay。
+首版不修改 Indexer 数据结构、现有 apply proto 和 Router，也不增加 WAL、staging、readiness gate、publisher epoch、lease、短 gap replay 或周期恢复。
+
+遗留问题：索引没有淘汰也没有 TTL，条目只有 REVOKE 和 CLEAR 两条出路。ZMQ 丢事件由 gap 检测触发全量恢复，不会留下残留；但 Publisher 漏发 REVOKE 或 mirror 与 Worker 真实状态不一致时，残留会持续累积且没有任何信号。先暴露索引条目数指标，再决定是否需要回收机制。
 
 ### 验收
 
@@ -114,7 +115,7 @@ Bridge：
 - Worker 重启后 seq 归零时 Bridge 立即触发恢复，而不是把新事件当成旧事件丢弃；
 - Indexer 慢响应时 Bridge 仍持续读取 ZMQ；
 - Snapshot 与 `last_seq` 在并发更新下保持原子一致；
-- Snapshot 任意分片失败时 cursor 不推进，重试后最终收敛；
+- Snapshot 任意分片失败时已应用序号不推进，重试后最终收敛；
 - 重复 Snapshot 和重叠事件不改变最终结果；
 - Snapshot 查询失败时 Bridge 不清空索引、不退出；
 - 高事件率下不会形成“恢复 → 队列溢出 → 再次恢复”的循环。
