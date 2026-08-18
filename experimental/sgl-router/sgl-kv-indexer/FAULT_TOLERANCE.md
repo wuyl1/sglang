@@ -52,6 +52,8 @@ snapshot.actions
 
 Publisher 必须原子复制 placement mirror 和 `last_seq`。幂等 apply 解决 Snapshot 与实时事件的重复；原子 `last_seq` 保证两者之间没有遗漏，因此不需要 barrier。
 
+这里的幂等指 REPORT 是 `(replica, tier, block)` 的整体替换、REVOKE 是移除、CLEAR 是清空，三者重复应用不改变结果。这是不需要 barrier 的唯一依据，改动 apply 语义（例如把 component mask 改成增量合并）会静默破坏本设计。
+
 ### Worker 生命周期
 
 任何会清空该 replica KV 缓存的重启之后，Publisher 发送的第一条事件必须是全 tier CLEAR。否则新 REPORT 会叠加到旧 placement 上，形成无法自愈的幽灵记录。
@@ -72,15 +74,19 @@ Bridge 在内存中维护已成功应用的最大 seq：
 
 - 单 writer、严格按序、同一时刻只有一个在途 apply；
 - ZMQ 订阅与 Indexer 写入使用两个任务，中间通过有界队列连接，避免慢 apply 阻塞 ZMQ 接收；
+- `received_seq` 小于期望值一律按 Worker 重启处理并触发恢复，这条判断必须先于“丢弃 seq <= cursor”，否则重启后 seq 归零的事件会被当成旧事件全部丢弃；
 - Snapshot 查询失败时保留当前索引并退避重试，不清空、不退出；
-- Snapshot 已部分应用时不推进 cursor，从 CLEAR 开始重试完整 Snapshot；
-- 普通实时 batch 的分片失败只重试该分片。
+- Snapshot 已部分应用时不推进 cursor，从 CLEAR 开始重试完整 Snapshot，期间索引停在空或部分状态，只影响命中率；
+- 普通实时 batch 的分片失败只重试该分片；
+- 重试与重连使用 full jitter 退避，避免 Indexer 重启后所有 Bridge 同时全量恢复。
 
 队列满时主动触发恢复。队列容量至少覆盖一次恢复期间产生的事件：
 
 ```text
 queue_capacity >= peak_event_rate * recovery_time
 ```
+
+`recovery_time` 为 Snapshot 查询超时加应用耗时。首版取查询超时 30s、队列容量 4096 条，再按实测事件率调整。
 
 ## 3. 改动与验收
 
@@ -105,6 +111,7 @@ Bridge：
 
 - Indexer、Bridge 或 Worker 重启后索引最终收敛；
 - ZMQ 丢事件后能够检测并恢复；
+- Worker 重启后 seq 归零时 Bridge 立即触发恢复，而不是把新事件当成旧事件丢弃；
 - Indexer 慢响应时 Bridge 仍持续读取 ZMQ；
 - Snapshot 与 `last_seq` 在并发更新下保持原子一致；
 - Snapshot 任意分片失败时 cursor 不推进，重试后最终收敛；
