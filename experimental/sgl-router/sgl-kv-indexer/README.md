@@ -9,6 +9,9 @@ This build deliberately uses one process-local in-memory index. It has no
 external storage dependency, but it is soft-state: restarting the Indexer loses
 all placement metadata.
 
+See [FAULT_TOLERANCE.md](FAULT_TOLERANCE.md) for the restart, worker-lifecycle,
+and event-gap recovery design.
+
 ## Architecture
 
 ```text
