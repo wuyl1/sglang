@@ -21,7 +21,6 @@ KV Indexer 是内存软状态，下面四类故障会让索引与 Worker 的真�
 | Bridge 重启 | Bridge 启动时没有已应用序号 | Snapshot |
 | Worker 重启 | epoch 变化，legacy 下为首条 CLEAR 或 seq 回退 | Snapshot |
 | ZMQ 丢事件 | seq gap | Replay，补不齐回落 Snapshot |
-| 事件解码失败 | payload 或 seq 无法解析 | Snapshot |
 
 无论走 Replay、Snapshot 还是实时流，所有事件都由 Bridge 的同一个 writer 严格按序写入 Indexer，同一时刻只有一个 apply 在执行。Bridge 同时记录**已应用序号**，即确认写入 Indexer 的最大 seq。
 
@@ -36,7 +35,7 @@ SGLang 的 `ZmqEventPublisher` 自带 ROUTER replay 端点和 `buffer_steps` 个
   -> 继续应用队列中的实时事件
 ```
 
-replay 不含 CLEAR，索引不会被擦掉重建。因此不需要按 gap 大小设阈值：gap 出现就先试 replay，补不齐再回落 Snapshot。解码失败时 replay 只会返回同一份坏数据，直接取 Snapshot。
+replay 不含 CLEAR，索引不会被擦掉重建。因此不需要按 gap 大小设阈值：gap 出现就先试 replay，补不齐再回落 Snapshot。
 
 三个必须处理的细节：
 
@@ -103,7 +102,7 @@ Bridge：
 1. 解耦 ZMQ 订阅与 Indexer 写入；
 2. 用单 writer 严格按序写入，跟踪 seq 和已应用序号，并解析 epoch；
 3. gap 时先 replay，补不齐或超时回落 Snapshot；
-4. 在启动、重连、epoch 变化、legacy seq 回退或解码失败时取 Snapshot；
+4. 在启动、重连、epoch 变化或 legacy seq 回退时取 Snapshot；
 5. 增加 snapshot 的 ZMQ 客户端，等待匹配的 barrier，并处理分块与中途失败。
 
 首版不修改 Indexer 数据结构、现有 apply proto 和 Router，也不增加 WAL、staging、readiness gate、lease 或周期恢复。
