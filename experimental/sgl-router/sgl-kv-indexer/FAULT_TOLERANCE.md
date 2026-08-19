@@ -60,25 +60,15 @@ snapshot 内容正好等于 Publisher 处理完水位之前所有事件之后的
 
 有了它就不需要 barrier：和实时事件重叠的部分由幂等吸收，水位保证重叠之外没有缺口。这里的幂等指 REPORT 整体替换 `(replica, tier, block)`、REVOKE 移除、CLEAR 清空，重复应用不改变结果。它是省掉 barrier 的唯一依据，所以 apply 语义不能动——把 component mask 改成增量合并之类的改动，会让整个设计不报错地失效。
 
-#### 还缺：snapshot 装不下我们的 placement 模型
+#### 当前 PR 还缺什么
 
-**这是唯一的硬阻塞。** 我们的 `BlockRecord` 需要每个 block 的 `token_count`，以及每个 `(worker, tier)` 的 component mask。上游给的是：
+**还缺 tier、block size 和 component mask，这是当前唯一的硬阻塞。**
 
-```text
-KVSnapshotBlock { parent_block_hash, block_hashes }
-mirror: dict[block_hash, KVSnapshotBlock]
-```
+- tier：当前 mirror 只按 block hash 保存，无法表示同一个 block 同时存在于 GPU 和 CPU，也无法只删除其中一层；
+- block size：重建后无法恢复 `token_count`；
+- component mask：重建后无法判断 block 包含哪些 KV component。
 
-`BlockStored` 携带的 `medium`、`block_size` 和 metadata 在写入 mirror 时就被丢弃，`BlockRemoved` 不看 `medium`，直接按 hash 删。所以问题不是少几个字段，而是**这个 mirror 结构上就是单 tier 的**：同一个 hash 同时驻留在两层无法表示，从一层移除会连带抹掉另一层。而我们的 CLEAR 是 `CLEAR_ALL_AT_TIER`，按层清——两个模型对不上。
-
-要推上游改四处：
-
-1. mirror 按 `(hash, medium)` 组织；
-2. 记录带上 `block_size` 与 component metadata；
-3. `BlockRemoved` 只删匹配的 medium；
-4. `KVSnapshotBlock` 相应加字段。
-
-升级路径是通的：header 里已有 `version`，当前为 1，且这些结构是 `array_like`，末尾追加字段对老消费者兼容。
+上游需要把 mirror 的 key 改为 `(hash, medium)`，并在 snapshot 记录中带上 `medium`、`block_size` 和 component metadata；`BlockRemoved` 也要按 medium 删除。协议已有 version，可以通过新版本增加这些字段。
 
 #### 适配项
 
