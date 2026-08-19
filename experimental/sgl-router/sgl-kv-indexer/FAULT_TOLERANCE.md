@@ -52,18 +52,13 @@ replay 不含 CLEAR，索引不会被擦掉重建。因此不需要按 gap 大�
 
 ### Snapshot 契约
 
-Snapshot 必须满足：
+我们对 Snapshot 只有两条要求。
 
-```text
-snapshot 内容
-    == Publisher 处理完所有 seq <= snapshot 水位 后的完整状态
-```
+一是它得是一个干净的切面：内容正好等于 Publisher 处理完水位之前所有事件之后的状态，mirror 和水位一起取下，不能一边拷贝一边还在变。有了这条就不需要 barrier——和实时事件重叠的部分由幂等吸收，水位保证重叠之外没有缺口。
 
-也就是说 Publisher 要原子地取下 placement mirror 和水位。幂等 apply 解决 Snapshot 与实时事件的重复，原子水位保证两者之间没有遗漏，因此我们不需要 barrier。
+所谓幂等，是指 REPORT 整体替换 `(replica, tier, block)`、REVOKE 移除、CLEAR 清空，重复应用不改变结果。这是省掉 barrier 的唯一依据，所以 apply 语义不能动；比如把 component mask 改成增量合并，整个设计就会不报错地失效。
 
-这里的幂等指 REPORT 是 `(replica, tier, block)` 的整体替换、REVOKE 是移除、CLEAR 是清空，三者重复应用不改变结果。这是不需要 barrier 的唯一依据，改动 apply 语义（例如把 component mask 改成增量合并）会静默破坏本设计。
-
-内容上，Snapshot 必须能重建 `BlockRecord`，即每个 block 的 `token_count`，以及每个 `(worker, tier)` 的 component mask。我们的索引不使用 parent 关系。
+二是内容得够我们重建 `BlockRecord`：每个 block 的 `token_count`，以及每个 `(worker, tier)` 的 component mask。parent 关系我们用不上。
 
 ### Snapshot 来源：上游 PR #34407
 
@@ -71,13 +66,13 @@ Snapshot 由上游 [#34407](https://github.com/sgl-project/sglang/pull/34407) �
 
 已经满足的：
 
-- placement mirror 与水位由同一个线程串行取下，原子性由构造保证，强于我们要求的下限；
+- 契约第一条：mirror 与水位由同一个线程串行取下，原子性由构造保证，强于我们要求的下限；
 - 按 DP replica 而不是 TP rank 划分，与我们的 replica 粒度一致；
 - 4096 条一块，在我们 16384 的 apply 上限之内。
 
 待确认与待适配：
 
-- **字段是否够用。** PR 描述里 snapshot 携带的是重建 parent 关系所需的 block 记录，那是上游 HashTree 的需求。tier、component mask 和 `token_count` 是否在内需要看代码确认；不在就必须推上游补齐，否则重建出的索引会丢掉分层和 component 信息。这是唯一的硬阻塞。
+- **契约第二条尚未确认，这是唯一的硬阻塞。** PR 描述里 snapshot 携带的是重建 parent 关系所需的 block 记录，那是上游 HashTree 的需求，和我们要的字段并不重合。需要看代码确认，不满足就得推上游补齐，否则重建出的索引会丢掉分层和 component 信息。
 - 传输是 ZMQ 端点而不是 gRPC 调用，Bridge 需要增加一个 snapshot 客户端。
 - 上游引入了 barrier（`barrier_seq`、`barrier_id`、`resume_seq`）。我们不需要 barrier 语义，取 `barrier_seq` 当水位即可，但必须能解析这些帧。
 - 该 PR 尚未合入，CI 未通过。在它落地前不要把这些接口当成稳定依赖。
