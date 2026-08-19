@@ -18,7 +18,7 @@ KV Indexer 是内存软状态，下面四类故障会让索引与 Worker 的真�
 | 故障 | 检测信号 | 恢复方式 |
 | --- | --- | --- |
 | Indexer 重启 | Bridge 建立新的 gRPC 连接 | Snapshot |
-| Bridge 重启 | Bridge 启动时没有已应用序号 | Snapshot |
+| Bridge 重启 | Bridge 启动 | 首版用 Snapshot；如果持久化 `(epoch, 已应用序号)` 且 epoch 未变化，可先 Replay，补不齐再回落 Snapshot |
 | Worker 重启 | epoch 变化 | Snapshot |
 | ZMQ 丢事件 | seq gap | Replay，补不齐回落 Snapshot |
 
