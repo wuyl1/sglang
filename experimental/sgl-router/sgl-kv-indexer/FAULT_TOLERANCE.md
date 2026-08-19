@@ -19,7 +19,7 @@ KV Indexer 是内存软状态，下面四类故障会让索引与 Worker 的真�
 | --- | --- | --- |
 | Indexer 重启 | Bridge 建立新的 gRPC 连接 | Snapshot |
 | Bridge 重启 | Bridge 启动时没有已应用序号 | Snapshot |
-| Worker 重启 | 首条 CLEAR 或 seq 回退 | Snapshot |
+| Worker 重启 | epoch 变化，legacy 下为首条 CLEAR 或 seq 回退 | Snapshot |
 | ZMQ 丢事件 | seq gap 或事件解码失败 | Replay，补不齐回落 Snapshot |
 
 ZMQ 丢事件只缺少数几个 batch，用 replay 补齐即可。其余三类故障要补的历史远超 replay 缓冲——索引全空、没有起点、缓存已清——只能取全量 Snapshot：
@@ -52,27 +52,43 @@ replay 不含 CLEAR，索引不会被擦掉重建。因此不需要按 gap 大�
 
 ### Snapshot 契约
 
-```text
-GetSnapshot(replica_key) -> {
-    actions: [CLEAR + REPORT],
-    last_seq: uint64,
-}
-```
-
-Snapshot 必须包含 hash、tier、component mask 和 block size，并满足：
+Snapshot 必须满足：
 
 ```text
-snapshot.actions
-    == Publisher 处理完所有 seq <= snapshot.last_seq 后的完整状态
+snapshot 内容
+    == Publisher 处理完所有 seq <= snapshot 水位 后的完整状态
 ```
 
-Publisher 必须原子复制 placement mirror 和 `last_seq`。幂等 apply 解决 Snapshot 与实时事件的重复；原子 `last_seq` 保证两者之间没有遗漏，因此不需要 barrier。
+也就是说 Publisher 要原子地取下 placement mirror 和水位。幂等 apply 解决 Snapshot 与实时事件的重复，原子水位保证两者之间没有遗漏，因此我们不需要 barrier。
 
 这里的幂等指 REPORT 是 `(replica, tier, block)` 的整体替换、REVOKE 是移除、CLEAR 是清空，三者重复应用不改变结果。这是不需要 barrier 的唯一依据，改动 apply 语义（例如把 component mask 改成增量合并）会静默破坏本设计。
 
+内容上，Snapshot 必须能重建 `BlockRecord`，即每个 block 的 `token_count`，以及每个 `(worker, tier)` 的 component mask。我们的索引不使用 parent 关系。
+
+### Snapshot 来源：上游 PR #34407
+
+Snapshot 由上游 [#34407](https://github.com/sgl-project/sglang/pull/34407) 提供，我们不自己实现。它在 publisher 上增加 `snapshot_endpoint`，按 DP replica 用 `base_port + dp_rank` 独立暴露，分块传输，每块最多 4096 条记录，并通过 `/server_info` 发现。
+
+已经满足的：
+
+- placement mirror 与水位由同一个线程串行取下，原子性由构造保证，强于我们要求的下限；
+- 按 DP replica 而不是 TP rank 划分，与我们的 replica 粒度一致；
+- 4096 条一块，在我们 16384 的 apply 上限之内。
+
+待确认与待适配：
+
+- **字段是否够用。** PR 描述里 snapshot 携带的是重建 parent 关系所需的 block 记录，那是上游 HashTree 的需求。tier、component mask 和 `token_count` 是否在内需要看代码确认；不在就必须推上游补齐，否则重建出的索引会丢掉分层和 component 信息。这是唯一的硬阻塞。
+- 传输是 ZMQ 端点而不是 gRPC 调用，Bridge 需要增加一个 snapshot 客户端。
+- 上游引入了 barrier（`barrier_seq`、`barrier_id`、`resume_seq`）。我们不需要 barrier 语义，取 `barrier_seq` 当水位即可，但必须能解析这些帧。
+- 该 PR 尚未合入，CI 未通过。在它落地前不要把这些接口当成稳定依赖。
+
 ### Worker 生命周期
 
-任何会清空该 replica KV 缓存的重启之后，Publisher 发送的第一条事件必须是全 tier CLEAR。否则新 REPORT 会叠加到旧 placement 上，形成无法自愈的幽灵记录。
+Worker 重启清空 KV 缓存后，如果新 REPORT 叠加到旧 placement 上，会形成无法自愈的幽灵记录，所以必须能识别出生命周期已经翻篇。
+
+优先使用 #34407 的 `epoch`：它按 DP replica 的生命周期划分，并随每条消息挂在 topic 帧上（NUL 分隔追加，SUB 前缀过滤不受影响）。epoch 变化即触发该 replica 重新同步。这比依赖一条事件更可靠——CLEAR 是单条事件，可能丢失，而 epoch 在任意一条消息上都能看到。
+
+对没有 epoch 的 legacy publisher，退回原有约定：重启后第一条事件必须是全 tier CLEAR，并以 seq 回退作为兜底信号。
 
 ### Bridge 行为
 
@@ -81,7 +97,7 @@ Bridge 在内存中维护一个**已应用序号**，即已经确认写入 Index
 ```text
 获取 Snapshot
   -> 按序应用全部分片
-  -> 已应用序号 = last_seq
+  -> 已应用序号 = snapshot 水位
   -> 丢弃队列中 seq <= 已应用序号 的事件
   -> 按序应用队列中 seq > 已应用序号 的事件
 ```
@@ -108,23 +124,20 @@ queue_capacity >= peak_event_rate * recovery_time
 
 ### 改动
 
-Publisher：
+Publisher 侧不写新代码，两项能力都已存在或在途：
 
-1. 维护 placement mirror；
-2. 原子生成 Snapshot 与 `last_seq`；
-3. Worker 生命周期重置后首先发送全 tier CLEAR。
-
-replay 已经实现，只需在 `--kv-events-config` 里配置 `replay_endpoint`。
+1. replay 已经实现，配置 `--kv-events-config` 的 `replay_endpoint` 即可；
+2. snapshot 与 epoch 依赖 #34407 合入，并需确认 snapshot 携带 tier、component mask 和 `token_count`。
 
 Bridge：
 
 1. 解耦 ZMQ 订阅与 Indexer 写入；
-2. 跟踪 seq 和已应用序号；
+2. 跟踪 seq 和已应用序号，解析 topic 帧中的 epoch；
 3. gap 时先 replay，校验首条回放 seq，补不齐或超时回落 Snapshot；
-4. 在启动、重连、回退和解码失败时取 Snapshot；
-5. 正确处理 Snapshot 中途失败。
+4. 在启动、重连、epoch 变化、回退和解码失败时取 Snapshot；
+5. 增加 snapshot 的 ZMQ 客户端，处理分块与中途失败。
 
-首版不修改 Indexer 数据结构、现有 apply proto 和 Router，也不增加 WAL、staging、readiness gate、publisher epoch、lease 或周期恢复。
+首版不修改 Indexer 数据结构、现有 apply proto 和 Router，也不增加 WAL、staging、readiness gate、lease 或周期恢复。上游的 barrier 我们只取其水位，不实现 barrier 等待语义。
 
 遗留问题：索引没有淘汰也没有 TTL，条目只有 REVOKE 和 CLEAR 两条出路。ZMQ 丢事件会被 gap 检测发现，replay 或 Snapshot 都会补上缺失的 REVOKE，不留残留；但 Publisher 漏发 REVOKE 或 mirror 与 Worker 真实状态不一致时，残留会持续累积且没有任何信号。先暴露索引条目数指标，再决定是否需要回收机制。
 
@@ -136,8 +149,10 @@ Bridge：
 - `END_SEQ` 不被当成真实 seq，已应用序号不会被推到 `u64::MAX`；
 - replay 无人应答时超时回落 Snapshot；
 - Worker 重启后 seq 归零时 Bridge 立即触发恢复，而不是把新事件当成旧事件丢弃；
+- epoch 变化后该 replica 重新同步，旧 placement 不残留；
+- Snapshot 重建后 tier、component mask 和 `token_count` 与重建前一致；
 - Indexer 慢响应时 Bridge 仍持续读取 ZMQ；
-- Snapshot 与 `last_seq` 在并发更新下保持原子一致；
+- Snapshot 与其水位在并发更新下保持原子一致；
 - Snapshot 任意分片失败时已应用序号不推进，重试后最终收敛；
 - 重复 Snapshot 和重叠事件不改变最终结果；
 - Snapshot 查询失败时 Bridge 不清空索引、不退出；
