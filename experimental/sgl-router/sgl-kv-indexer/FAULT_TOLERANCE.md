@@ -60,7 +60,11 @@ Snapshot 由上游 [#34407](https://github.com/sgl-project/sglang/pull/34407) �
 
 这里的幂等指 REPORT 整体替换 `(replica, tier, block)`、REVOKE 移除、CLEAR 清空，重复应用不改变结果。它是省掉 barrier 的唯一依据，所以 apply 语义不能动——把 component mask 改成增量合并之类的改动，会让整个设计不报错地失效。
 
-**二是字段够重建 `BlockRecord`。** 我们要的是每个 block 的 `token_count` 和每个 `(worker, tier)` 的 component mask，parent 关系用不上。而上游 snapshot 装的恰好是 parent 关系，那是它自己 HashTree 的需求，和我们要的并不重合。**这条还没确认，是唯一的硬阻塞**，得看代码，缺了就推上游补。
+**二是字段够重建 `BlockRecord`。** 我们要的是每个 block 的 `token_count` 和每个 `(worker, tier)` 的 component mask，parent 关系用不上。**上游不满足，这是唯一的硬阻塞。**
+
+`KVSnapshotBlock` 只有 `parent_block_hash` 和 `block_hashes`，publisher 的 mirror 也只是 `dict[block_hash, KVSnapshotBlock]`：`BlockStored` 的 `medium`、`block_size` 和 metadata 在写入 mirror 时就被丢弃，`BlockRemoved` 不看 `medium`，直接按 hash 删。所以它不是少几个字段，而是结构上就是单 tier 的——同一个 hash 同时驻留在两层无法表示，从一层移除会连带抹掉另一层。
+
+要推上游补的是：mirror 按 `(hash, medium)` 组织，记录带上 `block_size` 与 component metadata，`BlockRemoved` 只删匹配的 medium，`KVSnapshotBlock` 相应加字段。header 里已有 `version`，结构是 `array_like`，在末尾追加字段可以平滑升级。
 
 剩下三件是适配，不是障碍：snapshot 走 ZMQ 端点而不是 gRPC，Bridge 要加个客户端；上游的 barrier（`barrier_seq`、`barrier_id`、`resume_seq`）我们只取 `barrier_seq` 当水位，但帧得能解；PR 还没合、CI 未过，落地前别当成稳定依赖。
 
