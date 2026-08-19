@@ -19,7 +19,7 @@ KV Indexer 是内存软状态，下面四类故障会让索引与 Worker 的真�
 | --- | --- | --- |
 | Indexer 重启 | Bridge 建立新的 gRPC 连接 | Snapshot |
 | Bridge 重启 | Bridge 启动时没有已应用序号 | Snapshot |
-| Worker 重启 | epoch 变化，legacy 下为首条 CLEAR 或 seq 回退 | Snapshot |
+| Worker 重启 | epoch 变化 | Snapshot |
 | ZMQ 丢事件 | seq gap | Replay，补不齐回落 Snapshot |
 
 无论走 Replay、Snapshot 还是实时流，所有事件都由 Bridge 的同一个 writer 严格按序写入 Indexer，同一时刻只有一个 apply 在执行。Bridge 同时记录**已应用序号**，即确认写入 Indexer 的最大 seq。
@@ -86,7 +86,7 @@ Worker 重启清空 KV 缓存后，如果新 REPORT 叠加到旧 placement 上�
 
 优先使用 #34407 的 `epoch`：它按 DP replica 的生命周期划分，并随每条消息携带。epoch 变化就重新同步该 replica；同一 epoch 内收到不大于已应用序号的事件，只当作 replay 与实时流重叠产生的重复事件丢弃。
 
-对没有 epoch 的 legacy publisher，重启后第一条事件必须是全 tier CLEAR，并以 seq 回退作为兜底信号。
+没有 epoch 和 snapshot endpoint 的旧版 Publisher 保持 best-effort 模式，不保证 Worker 重启后恢复。
 
 ## 3. 改动与验收
 
@@ -102,7 +102,7 @@ Bridge：
 1. 解耦 ZMQ 订阅与 Indexer 写入；
 2. 用单 writer 严格按序写入，跟踪 seq 和已应用序号，并解析 epoch；
 3. gap 时先 replay，补不齐或超时回落 Snapshot；
-4. 在启动、重连、epoch 变化或 legacy seq 回退时取 Snapshot；
+4. 在启动、重连或 epoch 变化时取 Snapshot；
 5. 增加 snapshot 的 ZMQ 客户端，等待匹配的 barrier，并处理分块与中途失败。
 
 首版不修改 Indexer 数据结构、现有 apply proto 和 Router，也不增加 WAL、staging、readiness gate、lease 或周期恢复。
@@ -116,7 +116,6 @@ Bridge：
 - 请求的 seq 已被 replay 缓冲挤掉时回落 Snapshot 并最终收敛；
 - `END_SEQ` 不被当成真实 seq，已应用序号不会被推到 `u64::MAX`；
 - replay 无人应答时超时回落 Snapshot；
-- legacy Worker 重启后 seq 归零时 Bridge 立即触发恢复，而不是把新事件当成旧事件丢弃；
 - epoch 变化后该 replica 重新同步，旧 placement 不残留；
 - Snapshot 重建后 tier、component mask 和 `token_count` 与重建前一致；
 - Indexer 慢响应时 Bridge 仍持续读取 ZMQ；
