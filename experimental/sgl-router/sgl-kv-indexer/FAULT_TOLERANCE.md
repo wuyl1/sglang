@@ -54,19 +54,35 @@ replay 不含 CLEAR，索引不会被擦掉重建。因此不需要按 gap 大�
 
 Snapshot 由上游 [#34407](https://github.com/sgl-project/sglang/pull/34407) 提供，我们不自己实现。它给 publisher 加了 `snapshot_endpoint`，按 DP replica 独立暴露，分块传输，每块 4096 条记录，在我们 16384 的 apply 上限之内。
 
-我们对它只有两条要求。
+#### 已经满足：干净的切面
 
-**一是干净的切面。** 内容要正好等于 Publisher 处理完水位之前所有事件之后的状态，mirror 和水位一起取下，不能一边拷贝一边还在变。有了这条就不需要 barrier：和实时事件重叠的部分由幂等吸收，水位保证重叠之外没有缺口。上游把序号分配、事件应用和快照捕获放在同一个线程串行，这条由构造成立。
+snapshot 内容正好等于 Publisher 处理完水位之前所有事件之后的状态。上游把序号分配、事件应用和快照捕获放在同一个线程串行，这条由构造成立，不用额外论证。
 
-这里的幂等指 REPORT 整体替换 `(replica, tier, block)`、REVOKE 移除、CLEAR 清空，重复应用不改变结果。它是省掉 barrier 的唯一依据，所以 apply 语义不能动——把 component mask 改成增量合并之类的改动，会让整个设计不报错地失效。
+有了它就不需要 barrier：和实时事件重叠的部分由幂等吸收，水位保证重叠之外没有缺口。这里的幂等指 REPORT 整体替换 `(replica, tier, block)`、REVOKE 移除、CLEAR 清空，重复应用不改变结果。它是省掉 barrier 的唯一依据，所以 apply 语义不能动——把 component mask 改成增量合并之类的改动，会让整个设计不报错地失效。
 
-**二是字段够重建 `BlockRecord`。** 我们要的是每个 block 的 `token_count` 和每个 `(worker, tier)` 的 component mask，parent 关系用不上。**上游不满足，这是唯一的硬阻塞。**
+#### 还缺：snapshot 装不下我们的 placement 模型
 
-`KVSnapshotBlock` 只有 `parent_block_hash` 和 `block_hashes`，publisher 的 mirror 也只是 `dict[block_hash, KVSnapshotBlock]`：`BlockStored` 的 `medium`、`block_size` 和 metadata 在写入 mirror 时就被丢弃，`BlockRemoved` 不看 `medium`，直接按 hash 删。所以它不是少几个字段，而是结构上就是单 tier 的——同一个 hash 同时驻留在两层无法表示，从一层移除会连带抹掉另一层。
+**这是唯一的硬阻塞。** 我们的 `BlockRecord` 需要每个 block 的 `token_count`，以及每个 `(worker, tier)` 的 component mask。上游给的是：
 
-要推上游补的是：mirror 按 `(hash, medium)` 组织，记录带上 `block_size` 与 component metadata，`BlockRemoved` 只删匹配的 medium，`KVSnapshotBlock` 相应加字段。header 里已有 `version`，结构是 `array_like`，在末尾追加字段可以平滑升级。
+```text
+KVSnapshotBlock { parent_block_hash, block_hashes }
+mirror: dict[block_hash, KVSnapshotBlock]
+```
 
-剩下三件是适配，不是障碍：snapshot 走 ZMQ 端点而不是 gRPC，Bridge 要加个客户端；上游的 barrier（`barrier_seq`、`barrier_id`、`resume_seq`）我们只取 `barrier_seq` 当水位，但帧得能解；PR 还没合、CI 未过，落地前别当成稳定依赖。
+`BlockStored` 携带的 `medium`、`block_size` 和 metadata 在写入 mirror 时就被丢弃，`BlockRemoved` 不看 `medium`，直接按 hash 删。所以问题不是少几个字段，而是**这个 mirror 结构上就是单 tier 的**：同一个 hash 同时驻留在两层无法表示，从一层移除会连带抹掉另一层。而我们的 CLEAR 是 `CLEAR_ALL_AT_TIER`，按层清——两个模型对不上。
+
+要推上游改四处：
+
+1. mirror 按 `(hash, medium)` 组织；
+2. 记录带上 `block_size` 与 component metadata；
+3. `BlockRemoved` 只删匹配的 medium；
+4. `KVSnapshotBlock` 相应加字段。
+
+升级路径是通的：header 里已有 `version`，当前为 1，且这些结构是 `array_like`，末尾追加字段对老消费者兼容。
+
+#### 适配项
+
+不构成障碍，但要做：snapshot 走 ZMQ 端点而不是 gRPC，Bridge 要加个客户端；上游的 barrier（`barrier_seq`、`barrier_id`、`resume_seq`）我们只取 `barrier_seq` 当水位，但帧得能解；PR 还没合、CI 未过，落地前别当成稳定依赖，也意味着现在提上面那四处改动成本最低。
 
 ### Worker 生命周期
 
