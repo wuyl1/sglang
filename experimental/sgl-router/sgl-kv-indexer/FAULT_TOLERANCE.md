@@ -50,32 +50,19 @@ replay 不含 CLEAR，索引不会被擦掉重建。因此不需要按 gap 大�
 - `END_SEQ` 是 `-1` 的 8 字节大端补码，按 u64 解出来是 `u64::MAX`，必须特判。否则已应用序号会被推到顶，之后所有事件都被当成旧事件丢弃；
 - Publisher 的 replay 与发布共用一个线程，且异常只打日志，请求可能无人应答。Bridge 必须设超时并回落 Snapshot。
 
-### Snapshot 契约
+### Snapshot
 
-我们对 Snapshot 只有两条要求。
+Snapshot 由上游 [#34407](https://github.com/sgl-project/sglang/pull/34407) 提供，我们不自己实现。它给 publisher 加了 `snapshot_endpoint`，按 DP replica 独立暴露，分块传输，每块 4096 条记录，在我们 16384 的 apply 上限之内。
 
-一是它得是一个干净的切面：内容正好等于 Publisher 处理完水位之前所有事件之后的状态，mirror 和水位一起取下，不能一边拷贝一边还在变。有了这条就不需要 barrier——和实时事件重叠的部分由幂等吸收，水位保证重叠之外没有缺口。
+我们对它只有两条要求。
 
-所谓幂等，是指 REPORT 整体替换 `(replica, tier, block)`、REVOKE 移除、CLEAR 清空，重复应用不改变结果。这是省掉 barrier 的唯一依据，所以 apply 语义不能动；比如把 component mask 改成增量合并，整个设计就会不报错地失效。
+**一是干净的切面。** 内容要正好等于 Publisher 处理完水位之前所有事件之后的状态，mirror 和水位一起取下，不能一边拷贝一边还在变。有了这条就不需要 barrier：和实时事件重叠的部分由幂等吸收，水位保证重叠之外没有缺口。上游把序号分配、事件应用和快照捕获放在同一个线程串行，这条由构造成立。
 
-二是内容得够我们重建 `BlockRecord`：每个 block 的 `token_count`，以及每个 `(worker, tier)` 的 component mask。parent 关系我们用不上。
+这里的幂等指 REPORT 整体替换 `(replica, tier, block)`、REVOKE 移除、CLEAR 清空，重复应用不改变结果。它是省掉 barrier 的唯一依据，所以 apply 语义不能动——把 component mask 改成增量合并之类的改动，会让整个设计不报错地失效。
 
-### Snapshot 来源：上游 PR #34407
+**二是字段够重建 `BlockRecord`。** 我们要的是每个 block 的 `token_count` 和每个 `(worker, tier)` 的 component mask，parent 关系用不上。而上游 snapshot 装的恰好是 parent 关系，那是它自己 HashTree 的需求，和我们要的并不重合。**这条还没确认，是唯一的硬阻塞**，得看代码，缺了就推上游补。
 
-Snapshot 由上游 [#34407](https://github.com/sgl-project/sglang/pull/34407) 提供，我们不自己实现。它在 publisher 上增加 `snapshot_endpoint`，按 DP replica 用 `base_port + dp_rank` 独立暴露，分块传输，每块最多 4096 条记录，并通过 `/server_info` 发现。
-
-已经满足的：
-
-- 契约第一条：mirror 与水位由同一个线程串行取下，原子性由构造保证，强于我们要求的下限；
-- 按 DP replica 而不是 TP rank 划分，与我们的 replica 粒度一致；
-- 4096 条一块，在我们 16384 的 apply 上限之内。
-
-待确认与待适配：
-
-- **契约第二条尚未确认，这是唯一的硬阻塞。** PR 描述里 snapshot 携带的是重建 parent 关系所需的 block 记录，那是上游 HashTree 的需求，和我们要的字段并不重合。需要看代码确认，不满足就得推上游补齐，否则重建出的索引会丢掉分层和 component 信息。
-- 传输是 ZMQ 端点而不是 gRPC 调用，Bridge 需要增加一个 snapshot 客户端。
-- 上游引入了 barrier（`barrier_seq`、`barrier_id`、`resume_seq`）。我们不需要 barrier 语义，取 `barrier_seq` 当水位即可，但必须能解析这些帧。
-- 该 PR 尚未合入，CI 未通过。在它落地前不要把这些接口当成稳定依赖。
+剩下三件是适配，不是障碍：snapshot 走 ZMQ 端点而不是 gRPC，Bridge 要加个客户端；上游的 barrier（`barrier_seq`、`barrier_id`、`resume_seq`）我们只取 `barrier_seq` 当水位，但帧得能解；PR 还没合、CI 未过，落地前别当成稳定依赖。
 
 ### Worker 生命周期
 
