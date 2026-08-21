@@ -811,6 +811,11 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     # server_args.model_config is not serializable but should be excluded by asdict.
+    kv_events = server_args.describe_kv_events_publisher()
+    if kv_events is not None:
+        kv_events["worker_generation"] = getattr(
+            _global_state.tokenizer_manager, "instance_id", "uninitialized"
+        )
     return msgspec_to_builtins(
         {
             **dataclasses.asdict(server_args),
@@ -821,7 +826,7 @@ async def server_info():
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-            "kv_events": server_args.describe_kv_events_publisher(),
+            "kv_events": kv_events,
         }
     )
 
