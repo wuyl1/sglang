@@ -5,9 +5,12 @@
 //! barrier, then apply a fenced contiguous stream to the paired Indexer.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::{Channel, Endpoint};
 use tracing::{info, warn};
 use zeromq::{Socket, SocketRecv, SubSocket};
@@ -33,6 +36,14 @@ const INDEXER_EPOCH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const WORKER_GENERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_GENERATION_FAILURE_LIMIT: u32 = 2;
 const SNAPSHOT_APPEND_PLACEMENTS: usize = 16_384;
+// Batches the reader may hold while an apply is in flight. Sized for a long
+// Indexer stall rather than a steady backlog: a queue that is persistently
+// non-empty means the Indexer cannot keep up, and no capacity fixes that.
+const DEFAULT_LIVE_QUEUE_CAPACITY: usize = 8_192;
+// Streams allowed to fetch and install a snapshot at the same time. An Indexer
+// restart invalidates every stream at once, so without a bound the whole fleet
+// pulls full snapshots simultaneously from both the Indexer and the Workers.
+const DEFAULT_MAX_CONCURRENT_RECOVERIES: usize = 4;
 const EPOCH_MARKER: &[u8] = b"\x00sgl-kv-epoch=";
 const BARRIER_MARKER: &[u8] = b"\x00sgl-kv-snapshot=";
 
@@ -132,6 +143,22 @@ fn stream_id(worker: &BridgeWorkerConfig) -> StreamId {
 pub struct BridgeFleetConfig {
     pub indexer_endpoint: String,
     pub workers: Vec<BridgeWorkerConfig>,
+    /// Batches buffered per stream between the SUB socket and the Indexer.
+    pub live_queue_capacity: usize,
+    /// Streams permitted to install a snapshot concurrently.
+    pub max_concurrent_recoveries: usize,
+}
+
+fn env_positive(name: &str, default: usize) -> Result<usize, BridgeError> {
+    match std::env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| BridgeError::Config(format!("{name} must be a positive integer"))),
+        _ => Ok(default),
+    }
 }
 
 impl BridgeFleetConfig {
@@ -182,6 +209,14 @@ impl BridgeFleetConfig {
             indexer_endpoint: std::env::var("KV_INDEXER_ENDPOINT")
                 .unwrap_or_else(|_| "http://[::1]:50051".into()),
             workers,
+            live_queue_capacity: env_positive(
+                "KV_INDEXER_LIVE_QUEUE_CAPACITY",
+                DEFAULT_LIVE_QUEUE_CAPACITY,
+            )?,
+            max_concurrent_recoveries: env_positive(
+                "KV_INDEXER_MAX_CONCURRENT_RECOVERIES",
+                DEFAULT_MAX_CONCURRENT_RECOVERIES,
+            )?,
         }))
     }
 }
@@ -194,11 +229,16 @@ where
     F: std::future::Future<Output = ()>,
 {
     configure_workers(&config).await?;
+    let recoveries = Arc::new(Semaphore::new(config.max_concurrent_recoveries));
     let mut tasks = tokio::task::JoinSet::new();
     for worker in config.workers.clone() {
         let indexer = config.indexer_endpoint.clone();
         let expected = config.workers.clone();
-        tasks.spawn(async move { supervise_worker(indexer, worker, expected).await });
+        let capacity = config.live_queue_capacity;
+        let recoveries = Arc::clone(&recoveries);
+        tasks.spawn(async move {
+            supervise_worker(indexer, worker, expected, capacity, recoveries).await
+        });
     }
     tokio::pin!(shutdown);
     tokio::select! {
@@ -225,8 +265,10 @@ async fn supervise_worker(
     indexer_endpoint: String,
     worker: BridgeWorkerConfig,
     expected_workers: Vec<BridgeWorkerConfig>,
+    live_queue_capacity: usize,
+    recoveries: Arc<Semaphore>,
 ) -> Result<(), BridgeError> {
-    let mut delay = RECONNECT_BASE;
+    let mut backoff = Backoff::new(&worker.worker_id);
     loop {
         // Re-establish the complete desired Worker set after an Indexer restart.
         let indexer_epoch = match configure_worker_list(&indexer_endpoint, &expected_workers).await
@@ -236,37 +278,111 @@ async fn supervise_worker(
                 if error.is_permanent() {
                     return Err(error);
                 }
-                warn!(worker_id = %worker.worker_id, %error, retry_in = ?delay, "failed to configure restarted Indexer");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(RECONNECT_CAP);
+                let wait = backoff.next_wait();
+                warn!(worker_id = %worker.worker_id, %error, retry_in = ?wait, "failed to configure restarted Indexer");
+                tokio::time::sleep(wait).await;
                 continue;
             }
         };
+        // Invalidate before queueing for a recovery slot. This stream is
+        // already out of sync, so it has to stop being routable now rather than
+        // whenever a slot frees up.
         if let Err(error) = invalidate_worker(&indexer_endpoint, &worker).await {
             if error.is_permanent() {
                 return Err(error);
             }
-            warn!(worker_id = %worker.worker_id, %error, retry_in = ?delay, "failed to invalidate Worker before recovery");
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(RECONNECT_CAP);
+            let wait = backoff.next_wait();
+            warn!(worker_id = %worker.worker_id, %error, retry_in = ?wait, "failed to invalidate Worker before recovery");
+            tokio::time::sleep(wait).await;
             continue;
         }
+        let permit = Arc::clone(&recoveries)
+            .acquire_owned()
+            .await
+            .map_err(|error| BridgeError::Config(format!("recovery permits closed: {error}")))?;
         match recover_and_stream(
             &indexer_endpoint,
             &worker,
             &expected_workers,
             &indexer_epoch,
+            live_queue_capacity,
+            permit,
         )
         .await
         {
             Ok(()) => return Ok(()),
             Err(error) if error.is_permanent() => return Err(error),
             Err(error) => {
-                warn!(worker_id = %worker.worker_id, %error, retry_in = ?delay, "worker stream lost; rebuilding from snapshot");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(RECONNECT_CAP);
+                let wait = backoff.next_wait();
+                warn!(worker_id = %worker.worker_id, %error, retry_in = ?wait, "worker stream lost; rebuilding from snapshot");
+                tokio::time::sleep(wait).await;
             }
         }
+    }
+}
+
+/// Full-jitter reconnect backoff.
+///
+/// Every stream paired with one Indexer fails at the same instant when that
+/// Indexer restarts. A shared deterministic schedule then has them all retry
+/// together, rebuilding the stampede they are backing off from, so each wait is
+/// drawn uniformly below a doubling ceiling instead.
+struct Backoff {
+    ceiling: Duration,
+    state: u64,
+}
+
+impl Backoff {
+    fn new(seed: &str) -> Self {
+        let mut state = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in seed.as_bytes() {
+            state ^= u64::from(*byte);
+            state = state.wrapping_mul(0x100_0000_01b3);
+        }
+        // Two Bridges configured with the same worker ids must still diverge.
+        state ^= std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| u64::from(since.subsec_nanos()));
+        Self {
+            ceiling: RECONNECT_BASE,
+            state: state | 1,
+        }
+    }
+
+    fn next_wait(&mut self) -> Duration {
+        let mut state = self.state;
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        self.state = state;
+        let ceiling = u64::try_from(self.ceiling.as_nanos()).unwrap_or(u64::MAX);
+        let wait = state.wrapping_mul(0x2545_f491_4f6c_dd1d) % ceiling.max(1);
+        self.ceiling = (self.ceiling * 2).min(RECONNECT_CAP);
+        Duration::from_nanos(wait)
+    }
+}
+
+/// Recovery-path RPC classification.
+///
+/// The Indexer answers `FAILED_PRECONDITION` for a stream it has not been
+/// configured with, a stream holding no READY snapshot for the current epoch
+/// and generation, and a sequence gap. All three are repaired by rebuilding
+/// from a fresh snapshot, so treating them as permanent would retire the worker
+/// task -- and with it the entire fleet, because the supervisor returns as soon
+/// as any task finishes.
+fn classify_recovery_rpc(status: tonic::Status) -> BridgeError {
+    if status.code() == tonic::Code::FailedPrecondition {
+        return BridgeError::Rpc(status);
+    }
+    super::bridge::classify_rpc(status)
+}
+
+/// The reader owns the SUB socket, so it must not outlive the stream it feeds.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<(), BridgeError>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -281,7 +397,7 @@ async fn invalidate_worker(
             stream_id: Some(stream_id(worker)),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(())
 }
 
@@ -308,7 +424,7 @@ async fn configure_worker_list(
                 .collect(),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(response.into_inner().indexer_epoch)
 }
 
@@ -377,7 +493,7 @@ async fn install_snapshot(
                 expected_placements: snapshot.placements.len() as u64,
             })
             .await
-            .map_err(super::bridge::classify_rpc)?
+            .map_err(classify_recovery_rpc)?
             .into_inner();
         for chunk in snapshot.placements.chunks(SNAPSHOT_APPEND_PLACEMENTS) {
             let append = client
@@ -401,7 +517,7 @@ async fn install_snapshot(
                         transaction_id: begin.transaction_id,
                     })
                     .await;
-                return Err(super::bridge::classify_rpc(error));
+                return Err(classify_recovery_rpc(error));
             }
         }
         client
@@ -409,7 +525,7 @@ async fn install_snapshot(
                 transaction_id: begin.transaction_id,
             })
             .await
-            .map_err(super::bridge::classify_rpc)?;
+            .map_err(classify_recovery_rpc)?;
         return Ok((worker_generation, Some(wire_cache_spec(metadata))));
     }
 
@@ -438,7 +554,7 @@ async fn install_snapshot(
             worker_generation: String::new(),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok((worker_generation, cache_spec))
 }
 
@@ -470,7 +586,7 @@ async fn apply_live_payload(
     client
         .apply_external_kv_batch(request)
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(())
 }
 
@@ -479,6 +595,8 @@ async fn recover_and_stream(
     worker: &BridgeWorkerConfig,
     expected_workers: &[BridgeWorkerConfig],
     indexer_epoch: &str,
+    live_queue_capacity: usize,
+    recovery_permit: OwnedSemaphorePermit,
 ) -> Result<(), BridgeError> {
     let mut client = connect_indexer(indexer_endpoint).await?;
     let mut subscriber = SubSocket::new();
@@ -521,8 +639,43 @@ async fn recover_and_stream(
     .await
     .map_err(|_| BridgeError::Decode("timed out waiting for snapshot barrier".into()))??;
 
+    // Hand the socket to a reader task before installing rather than after. A
+    // large install is many gRPC round trips, and anything the Worker publishes
+    // during that window would otherwise sit unread until ZeroMQ's high-water
+    // mark discarded it, where the loss leaves no local record.
+    let (frames_tx, mut frames_rx) = mpsc::channel::<LiveFrame>(live_queue_capacity);
+    let reader_worker_id = worker.worker_id.clone();
+    let mut reader = AbortOnDrop(tokio::spawn(async move {
+        let mut overflowed = 0_u64;
+        loop {
+            let message = subscriber.recv().await?;
+            let frame = parse_live_message(&message.into_vec())?;
+            match frames_tx.try_send(frame) {
+                Ok(()) => {}
+                // Only the writer drops the receiver, and only on its way out.
+                Err(TrySendError::Closed(_)) => return Ok(()),
+                Err(TrySendError::Full(frame)) => {
+                    // Dropping here is deliberate. Awaiting capacity would stop
+                    // draining the socket and move the same loss into ZeroMQ,
+                    // where it is silent; a batch dropped here reappears
+                    // downstream as a sequence gap that replay, or failing that
+                    // a fresh snapshot, repairs.
+                    overflowed = overflowed.saturating_add(1);
+                    warn!(
+                        worker_id = %reader_worker_id,
+                        seq = frame.seq,
+                        overflowed,
+                        "live queue is full; dropping a batch for the gap path to repair"
+                    );
+                }
+            }
+        }
+    }));
+
     let (worker_generation, recovered_cache_spec) =
         install_snapshot(&mut client, worker, &snapshot).await?;
+    // The contended part is done; let the next stream start recovering.
+    drop(recovery_permit);
     info!(worker_id = %worker.worker_id, epoch = %epoch, barrier_seq, "worker snapshot installed; stream READY");
 
     let bridge_config = BridgeConfig {
@@ -548,8 +701,18 @@ async fn recover_and_stream(
     epoch_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     epoch_check.tick().await;
     loop {
-        let message = tokio::select! {
-            message = subscriber.recv() => message?,
+        let frame = tokio::select! {
+            frame = frames_rx.recv() => match frame {
+                Some(frame) => frame,
+                // The reader holds the only sender and outlives this loop
+                // unless the socket failed, so surface why it stopped.
+                None => return match (&mut reader.0).await {
+                    Ok(result) => result,
+                    Err(error) => Err(BridgeError::Config(format!(
+                        "live reader task failed: {error}"
+                    ))),
+                },
+            },
             _ = epoch_check.tick() => {
                 let current = configure_worker_list(indexer_endpoint, expected_workers).await?;
                 if current != indexer_epoch {
@@ -580,7 +743,6 @@ async fn recover_and_stream(
                 continue;
             }
         };
-        let frame = parse_live_message(&message.into_vec())?;
         if frame.epoch.as_deref() != Some(epoch.as_str()) {
             return Err(BridgeError::Decode("worker epoch changed".into()));
         }
@@ -691,6 +853,121 @@ mod tests {
     use crate::pb::kv_indexer_client::KvIndexerClient;
     use crate::pb::MatchExternalKvPrefixRequest;
     use crate::{server_builder, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService};
+
+    /// The Indexer reports an unconfigured stream, a stale generation, and a
+    /// sequence gap all as FAILED_PRECONDITION. Each is repaired by a fresh
+    /// snapshot, but the shared classifier calls the code permanent, which
+    /// retires the worker task and takes the fleet down with it.
+    #[test]
+    fn an_indexer_resync_signal_is_not_a_permanent_failure() {
+        let gap = classify_recovery_rpc(tonic::Status::failed_precondition(
+            "event sequence gap: expected 5, got 9",
+        ));
+        let contract =
+            classify_recovery_rpc(tonic::Status::invalid_argument("unsupported action type"));
+
+        assert!(!gap.is_permanent());
+        // A contract violation is not repaired by retrying, so it must still stop.
+        assert!(contract.is_permanent());
+    }
+
+    /// A reader that awaits queue capacity stops draining the SUB socket, which
+    /// converts a slow Indexer into silent ZeroMQ loss. Dropping instead keeps
+    /// the socket moving and leaves a sequence gap the writer can repair.
+    #[tokio::test]
+    async fn a_full_live_queue_drops_instead_of_stalling_the_reader() {
+        let (tx, mut rx) = mpsc::channel::<LiveFrame>(1);
+        let frame = |seq| LiveFrame {
+            seq,
+            epoch: Some("e1".into()),
+            barrier_id: None,
+            payload: Vec::new(),
+        };
+
+        assert!(tx.try_send(frame(1)).is_ok());
+        let rejected = tx.try_send(frame(2));
+
+        assert!(matches!(rejected, Err(TrySendError::Full(_))));
+        // The queued batch is untouched, so the writer sees 1 then 3: a gap,
+        // not a stall and not a silently reordered stream.
+        assert_eq!(rx.recv().await.map(|frame| frame.seq), Some(1));
+        assert!(tx.try_send(frame(3)).is_ok());
+        assert_eq!(rx.recv().await.map(|frame| frame.seq), Some(3));
+    }
+
+    /// An Indexer restart invalidates every stream at once. Without a bound the
+    /// whole fleet pulls full snapshots from its Workers simultaneously, which
+    /// is the load spike recovery is supposed to absorb.
+    #[tokio::test]
+    async fn concurrent_snapshot_recoveries_stay_within_the_configured_bound() {
+        const WORKERS: usize = 6;
+        const BOUND: usize = 2;
+
+        let mut publisher = PubSocket::new();
+        let pub_port = match publisher.bind("tcp://127.0.0.1:0").await.unwrap() {
+            Endpoint::Tcp(_, port) => port,
+            other => panic!("unexpected endpoint: {other:?}"),
+        };
+        // One socket serves every stream, so in-flight requests are countable
+        // in one place.
+        let mut snapshot_router = RouterSocket::new();
+        let snapshot_port = match snapshot_router.bind("tcp://127.0.0.1:0").await.unwrap() {
+            Endpoint::Tcp(_, port) => port,
+            other => panic!("unexpected endpoint: {other:?}"),
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let indexer_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let indexer_server = start_indexer_server(indexer_addr);
+
+        let workers = (0..WORKERS)
+            .map(|index| BridgeWorkerConfig {
+                namespace: String::new(),
+                worker_id: format!("w{index}"),
+                worker_address: "http://w".into(),
+                event_endpoint: format!("tcp://127.0.0.1:{pub_port}"),
+                snapshot_endpoint: format!("tcp://127.0.0.1:{snapshot_port}"),
+                snapshot_protocol_version: 1,
+                replay_endpoint: None,
+                event_topic: "kv".into(),
+                dp_rank: 0,
+                hash_schema_version: 1,
+                page_size: 1,
+                is_bigram: false,
+                model: "unknown".into(),
+            })
+            .collect();
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let fleet = tokio::spawn(run_recoverable_bridge_fleet_until(
+            BridgeFleetConfig {
+                indexer_endpoint: format!("http://{indexer_addr}"),
+                live_queue_capacity: DEFAULT_LIVE_QUEUE_CAPACITY,
+                max_concurrent_recoveries: BOUND,
+                workers,
+            },
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+
+        // Never answer: every admitted stream keeps its permit, so the count of
+        // arrived requests is the concurrency the semaphore allowed.
+        let mut admitted = 0;
+        while tokio::time::timeout(Duration::from_millis(400), snapshot_router.recv())
+            .await
+            .is_ok()
+        {
+            admitted += 1;
+            assert!(admitted <= BOUND, "{admitted} streams fetched at once");
+        }
+
+        assert_eq!(admitted, BOUND);
+        let _ = stop_tx.send(());
+        let _ = fleet.await;
+        indexer_server.abort();
+    }
 
     #[test]
     fn parses_snapshot_topic_metadata() {
@@ -933,6 +1210,8 @@ mod tests {
         let fleet = tokio::spawn(run_recoverable_bridge_fleet_until(
             BridgeFleetConfig {
                 indexer_endpoint: format!("http://{indexer_addr}"),
+                live_queue_capacity: DEFAULT_LIVE_QUEUE_CAPACITY,
+                max_concurrent_recoveries: DEFAULT_MAX_CONCURRENT_RECOVERIES,
                 workers: vec![BridgeWorkerConfig {
                     namespace: "ns".into(),
                     worker_id: "w1".into(),
@@ -1043,6 +1322,8 @@ mod tests {
         let fleet = tokio::spawn(run_recoverable_bridge_fleet_until(
             BridgeFleetConfig {
                 indexer_endpoint: format!("http://{indexer_addr}"),
+                live_queue_capacity: DEFAULT_LIVE_QUEUE_CAPACITY,
+                max_concurrent_recoveries: DEFAULT_MAX_CONCURRENT_RECOVERIES,
                 workers: vec![BridgeWorkerConfig {
                     namespace: String::new(),
                     worker_id: "w1".into(),

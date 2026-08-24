@@ -262,6 +262,13 @@ Required or commonly used bridge variables:
   optionally accepts `event_topic` and `dp_rank`
 - `KV_INDEXER_ENDPOINT`: paired Indexer endpoint, default
   `http://[::1]:50051`
+- `KV_INDEXER_LIVE_QUEUE_CAPACITY`: batches buffered per stream between the SUB
+  socket and the Indexer, default `8192`. Raise it if a slow Indexer logs
+  `live queue is full`; the dropped batches are repaired as sequence gaps, but
+  each repair costs a replay or a snapshot
+- `KV_INDEXER_MAX_CONCURRENT_RECOVERIES`: streams allowed to install a snapshot
+  at the same time, default `4`. An Indexer restart invalidates every stream at
+  once, and this caps the resulting snapshot load on the Workers
 
 The variables below are the backward-compatible, non-recoverable single-Worker
 mode. They are ignored when `KV_INDEXER_WORKERS_JSON` is present:
