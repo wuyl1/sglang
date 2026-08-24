@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::{Channel, Endpoint};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
 use crate::bridge::{build_apply_request, decode_event_batch, BridgeConfig, BridgeError};
@@ -240,17 +240,46 @@ where
             supervise_worker(indexer, worker, expected, capacity, recoveries).await
         });
     }
+    supervise_fleet(tasks, shutdown).await
+}
+
+/// Wait out the fleet, retiring streams one at a time.
+///
+/// One stream retiring must not unroute the others. A permanent failure means
+/// the Bridge and the Indexer disagree about that stream -- a contract the
+/// Indexer rejects, or a batch no retry can make appliable -- which says
+/// nothing about its peers. The retiring stream is left invalidated so the
+/// Router stops trusting its placement, and the fleet only gives up once every
+/// stream is gone, which is the signal that the disagreement is systemic.
+async fn supervise_fleet<F>(
+    mut tasks: tokio::task::JoinSet<Result<(), BridgeError>>,
+    shutdown: F,
+) -> Result<(), BridgeError>
+where
+    F: std::future::Future<Output = ()>,
+{
     tokio::pin!(shutdown);
-    tokio::select! {
-        _ = &mut shutdown => {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-            Ok(())
-        }
-        result = tasks.join_next() => match result {
-            Some(Ok(result)) => result,
-            Some(Err(error)) => Err(BridgeError::Config(format!("worker recovery task failed: {error}"))),
-            None => Err(BridgeError::Config("worker recovery fleet exited".into())),
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Ok(());
+            }
+            joined = tasks.join_next() => match joined {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(error))) => {
+                    error!(%error, "worker stream retired; remaining streams keep serving");
+                }
+                Some(Err(error)) => {
+                    error!(%error, "worker recovery task failed; remaining streams keep serving");
+                }
+                None => {
+                    return Err(BridgeError::Config(
+                        "every worker stream retired; no placement is being tracked".into(),
+                    ))
+                }
+            },
         }
     }
 }
@@ -268,11 +297,35 @@ async fn supervise_worker(
     live_queue_capacity: usize,
     recoveries: Arc<Semaphore>,
 ) -> Result<(), BridgeError> {
+    let result = stream_worker(
+        &indexer_endpoint,
+        &worker,
+        &expected_workers,
+        live_queue_capacity,
+        recoveries,
+    )
+    .await;
+    if result.is_err() {
+        // Nothing will refresh this stream again, and it still holds whatever
+        // placement it installed before failing.
+        if let Err(error) = invalidate_worker(&indexer_endpoint, &worker).await {
+            warn!(worker_id = %worker.worker_id, %error, "failed to invalidate a retired Worker");
+        }
+    }
+    result
+}
+
+async fn stream_worker(
+    indexer_endpoint: &str,
+    worker: &BridgeWorkerConfig,
+    expected_workers: &[BridgeWorkerConfig],
+    live_queue_capacity: usize,
+    recoveries: Arc<Semaphore>,
+) -> Result<(), BridgeError> {
     let mut backoff = Backoff::new(&worker.worker_id);
     loop {
         // Re-establish the complete desired Worker set after an Indexer restart.
-        let indexer_epoch = match configure_worker_list(&indexer_endpoint, &expected_workers).await
-        {
+        let indexer_epoch = match configure_worker_list(indexer_endpoint, expected_workers).await {
             Ok(epoch) => epoch,
             Err(error) => {
                 if error.is_permanent() {
@@ -287,7 +340,7 @@ async fn supervise_worker(
         // Invalidate before queueing for a recovery slot. This stream is
         // already out of sync, so it has to stop being routable now rather than
         // whenever a slot frees up.
-        if let Err(error) = invalidate_worker(&indexer_endpoint, &worker).await {
+        if let Err(error) = invalidate_worker(indexer_endpoint, worker).await {
             if error.is_permanent() {
                 return Err(error);
             }
@@ -301,9 +354,9 @@ async fn supervise_worker(
             .await
             .map_err(|error| BridgeError::Config(format!("recovery permits closed: {error}")))?;
         match recover_and_stream(
-            &indexer_endpoint,
-            &worker,
-            &expected_workers,
+            indexer_endpoint,
+            worker,
+            expected_workers,
             &indexer_epoch,
             live_queue_capacity,
             permit,
@@ -893,6 +946,49 @@ mod tests {
         assert_eq!(rx.recv().await.map(|frame| frame.seq), Some(1));
         assert!(tx.try_send(frame(3)).is_ok());
         assert_eq!(rx.recv().await.map(|frame| frame.seq), Some(3));
+    }
+
+    /// A permanent failure is scoped to the stream that hit it: the supervisor
+    /// used to return as soon as any task finished, so one stream the Indexer
+    /// rejected unrouted every healthy worker beside it.
+    #[tokio::test]
+    async fn a_retired_stream_leaves_the_rest_of_the_fleet_running() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { Err(BridgeError::Config("Indexer rejected the stream".into())) });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tasks.spawn(async move {
+            let _ = release_rx.await;
+            Ok(())
+        });
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let fleet = tokio::spawn(supervise_fleet(tasks, async {
+            let _ = stop_rx.await;
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            !fleet.is_finished(),
+            "one retired stream took the whole fleet down"
+        );
+        let _ = stop_tx.send(());
+        assert!(fleet.await.unwrap().is_ok());
+        drop(release_tx);
+    }
+
+    /// Every stream retiring is a different signal: the disagreement is
+    /// systemic, nothing is tracking placement any more, and idling would hide
+    /// that behind a healthy-looking process.
+    #[tokio::test]
+    async fn a_fleet_with_no_surviving_stream_stops() {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            tasks.spawn(async { Err(BridgeError::Config("Indexer rejected the stream".into())) });
+        }
+
+        let result = supervise_fleet(tasks, std::future::pending()).await;
+
+        assert!(result.is_err());
     }
 
     /// An Indexer restart invalidates every stream at once. Without a bound the
