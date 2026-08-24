@@ -270,6 +270,21 @@ async fn supervise_worker(
     }
 }
 
+/// Recovery-path RPC classification.
+///
+/// The Indexer answers `FAILED_PRECONDITION` for a stream it has not been
+/// configured with, a stream holding no READY snapshot for the current epoch
+/// and generation, and a sequence gap. All three describe a Bridge that has
+/// fallen out of step with the Indexer, and all three are repaired by
+/// rebuilding from a fresh snapshot. The shared classifier calls the code
+/// permanent, which ends the worker task instead of letting it resynchronise.
+fn classify_recovery_rpc(status: tonic::Status) -> BridgeError {
+    if status.code() == tonic::Code::FailedPrecondition {
+        return BridgeError::Rpc(status);
+    }
+    super::bridge::classify_rpc(status)
+}
+
 async fn invalidate_worker(
     indexer_endpoint: &str,
     worker: &BridgeWorkerConfig,
@@ -281,7 +296,7 @@ async fn invalidate_worker(
             stream_id: Some(stream_id(worker)),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(())
 }
 
@@ -308,7 +323,7 @@ async fn configure_worker_list(
                 .collect(),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(response.into_inner().indexer_epoch)
 }
 
@@ -377,7 +392,7 @@ async fn install_snapshot(
                 expected_placements: snapshot.placements.len() as u64,
             })
             .await
-            .map_err(super::bridge::classify_rpc)?
+            .map_err(classify_recovery_rpc)?
             .into_inner();
         for chunk in snapshot.placements.chunks(SNAPSHOT_APPEND_PLACEMENTS) {
             let append = client
@@ -401,7 +416,7 @@ async fn install_snapshot(
                         transaction_id: begin.transaction_id,
                     })
                     .await;
-                return Err(super::bridge::classify_rpc(error));
+                return Err(classify_recovery_rpc(error));
             }
         }
         client
@@ -409,7 +424,7 @@ async fn install_snapshot(
                 transaction_id: begin.transaction_id,
             })
             .await
-            .map_err(super::bridge::classify_rpc)?;
+            .map_err(classify_recovery_rpc)?;
         return Ok((worker_generation, Some(wire_cache_spec(metadata))));
     }
 
@@ -438,7 +453,7 @@ async fn install_snapshot(
             worker_generation: String::new(),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok((worker_generation, cache_spec))
 }
 
@@ -470,7 +485,7 @@ async fn apply_live_payload(
     client
         .apply_external_kv_batch(request)
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(())
 }
 
@@ -691,6 +706,22 @@ mod tests {
     use crate::pb::kv_indexer_client::KvIndexerClient;
     use crate::pb::MatchExternalKvPrefixRequest;
     use crate::{server_builder, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService};
+
+    /// A stream that has fallen out of step must be able to rebuild. Treating
+    /// the Indexer's resync signal as permanent ends the worker task instead,
+    /// so the stream never recovers from a gap the replay path could repair.
+    #[test]
+    fn an_indexer_resync_signal_is_not_a_permanent_failure() {
+        let gap = classify_recovery_rpc(tonic::Status::failed_precondition(
+            "event sequence gap: expected 5, got 9",
+        ));
+        let contract =
+            classify_recovery_rpc(tonic::Status::invalid_argument("unsupported action type"));
+
+        assert!(!gap.is_permanent());
+        // A contract violation is not repaired by retrying, so it must still stop.
+        assert!(contract.is_permanent());
+    }
 
     #[test]
     fn parses_snapshot_topic_metadata() {
