@@ -204,7 +204,7 @@ async fn prepare<'a>(
             let model =
                 ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
-            let needs_tokens = routing.needs_request_tokens(ctx);
+            let needs_tokens = routing.needs_request_tokens(ctx) || ctx.umbp_prefetch.is_some();
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {

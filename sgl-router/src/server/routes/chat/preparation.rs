@@ -569,6 +569,44 @@ impl PreparedRequest {
         !matches!(self.path, EMBEDDINGS_PATH | CLASSIFY_PATH | RERANK_PATH)
     }
 
+    /// Prefetch only the exact engine IDs in the base storage namespace.
+    /// Typed requests lack namespace/media fields in RoutingView, so skip them.
+    pub(super) fn prefetch_token_ids(&self, outgoing_body: &[u8]) -> Option<&[u32]> {
+        if self.fans_out || !matches!(self.path, CHAT_PATH | GENERATE_PATH) {
+            return None;
+        }
+        let tokens = self.tokens.as_ref()?;
+        let value: Value = serde_json::from_slice(outgoing_body).ok()?;
+        if self.cache_namespace != *CacheNamespace::NONE
+            || cache_namespace(self.path, &value) != *CacheNamespace::NONE
+            || request_has_multimodal_content(&value)
+            || [
+                "cache_salt",
+                "lora_path",
+                "lora_id",
+                "extra_key",
+                "extra_keys",
+                "input_embeds",
+                "image_data",
+                "video_data",
+                "audio_data",
+                "session_params",
+                "positional_embed_overrides",
+            ]
+            .iter()
+            .any(|key| !value[key].is_null())
+        {
+            return None;
+        }
+        let ids = value["input_ids"].as_array()?;
+        (ids.len() == tokens.ids.len()
+            && ids
+                .iter()
+                .zip(&tokens.ids)
+                .all(|(id, &token)| id.as_u64() == Some(u64::from(token))))
+        .then_some(tokens.ids.as_slice())
+    }
+
     pub(super) fn engine_rid(&self) -> Option<String> {
         // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
         // PD shares the minted ID, but only decode arms abort-on-drop.
@@ -1609,6 +1647,40 @@ mod tests {
     fn prepare_generate(body: Value) -> PreparedRequest {
         let body = Bytes::from(body.to_string());
         PreparedRequest::generate(&tokenizer_ctx(), ModelId("stub-model".into()), body).unwrap()
+    }
+
+    #[test]
+    fn prefetch_requires_engine_ids_without_storage_or_media_overrides() {
+        let mut ctx = tokenizer_ctx();
+        let prepare = |ctx: &AppContext, value: Value| {
+            PreparedRequest::generate(ctx, ModelId("stub-model".into()), value.to_string().into())
+                .unwrap()
+        };
+        let request = prepare(&ctx, json!({"text": "hello"}));
+        assert_eq!(
+            request.prefetch_token_ids(&request.body),
+            Some(request.tokens.as_ref().unwrap().ids.as_slice())
+        );
+        assert!(request
+            .prefetch_token_ids(br#"{"input_ids": [999]}"#)
+            .is_none());
+        for value in [
+            json!({"input_ids": [1], "cache_salt": "tenant"}),
+            json!({"input_ids": [1], "lora_path": "adapter"}),
+            json!({"input_ids": [1], "extra_key": "other"}),
+            json!({"input_ids": [1], "image_data": "image.png"}),
+            json!({"input_ids": [1], "session_params": {"id": "history"}}),
+            json!({"input_ids": [1], "positional_embed_overrides": {"position": 5}}),
+            json!({"input_ids": [[1], [2]]}),
+        ] {
+            let request = prepare(&ctx, value);
+            assert!(request.prefetch_token_ids(&request.body).is_none());
+        }
+        ctx.config.model.disable_input_ids_forwarding = true;
+        let request = prepare(&ctx, json!({"text": "hello"}));
+        assert!(request.tokens.is_some());
+        assert!(request.prefetch_token_ids(&request.body).is_none());
+        assert!(request.prefetch_token_ids(&[]).is_none());
     }
 
     fn prepare_embeddings(ctx: &AppContext, input: Value) -> (PreparedRequest, Value) {

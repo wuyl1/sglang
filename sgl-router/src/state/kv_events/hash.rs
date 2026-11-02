@@ -70,9 +70,9 @@ impl CacheNamespace {
             .as_deref()
             .map(|salt| sha256_parts(&[b"sglang-cache-salt-v1\0", salt.as_bytes()]));
         let hashes = if bigram {
-            chain_bigram(token_ids, block_size, prior)
+            chain_bigram(token_ids, block_size, prior, sha256_to_i64)
         } else {
-            chain(token_ids, block_size, prior)
+            chain(token_ids, block_size, prior, sha256_to_i64)
         };
         let Some(lora_name) = self.lora_name.as_deref() else {
             return hashes;
@@ -106,10 +106,21 @@ fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
 /// up-front against the worker-published `block_size`; an invalid value is
 /// a programmer/config bug, not a runtime input we should swallow.
 pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
-    chain(token_ids, block_size, None)
+    chain(token_ids, block_size, None, sha256_to_i64)
 }
 
-fn chain(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
+/// Full lowercase SHA256 storage keys for an unnamespaced request.
+/// Includes a partial last block, as [`compute_block_hashes`] does.
+pub fn compute_block_hashes_hex(token_ids: &[u32], block_size: usize) -> Vec<String> {
+    chain(token_ids, block_size, None, digest_to_hex)
+}
+
+fn chain<T>(
+    token_ids: &[u32],
+    block_size: usize,
+    mut prior: Option<[u8; 32]>,
+    encode: impl Fn(&[u8; 32]) -> T,
+) -> Vec<T> {
     assert!(block_size > 0, "block_size must be positive");
     if token_ids.is_empty() {
         return Vec::new();
@@ -123,7 +134,7 @@ fn chain(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> V
     while start < n {
         let end = (start + block_size).min(n);
         let digest = chain_block(prior.as_ref(), &token_ids[start..end]);
-        out.push(sha256_to_i64(&digest));
+        out.push(encode(&digest));
         prior = Some(digest);
         start = end;
     }
@@ -181,10 +192,20 @@ pub fn sha256_to_i64(digest: &[u8; 32]) -> i64 {
 /// hashes won't match the worker's stored bigram block hashes and cache-aware
 /// routing silently degrades to min-load.
 pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<i64> {
-    chain_bigram(token_ids, block_size, None)
+    chain_bigram(token_ids, block_size, None, sha256_to_i64)
 }
 
-fn chain_bigram(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
+/// Bigram counterpart of [`compute_block_hashes_hex`].
+pub fn compute_block_hashes_hex_bigram(token_ids: &[u32], block_size: usize) -> Vec<String> {
+    chain_bigram(token_ids, block_size, None, digest_to_hex)
+}
+
+fn chain_bigram<T>(
+    token_ids: &[u32],
+    block_size: usize,
+    mut prior: Option<[u8; 32]>,
+    encode: impl Fn(&[u8; 32]) -> T,
+) -> Vec<T> {
     assert!(block_size > 0, "block_size must be positive");
     // N raw tokens -> N-1 overlapping bigrams; fewer than 2 tokens -> no blocks.
     let logical_len = token_ids.len().saturating_sub(1);
@@ -198,7 +219,7 @@ fn chain_bigram(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]
     while start < logical_len {
         let end = (start + block_size).min(logical_len);
         let digest = chain_block_bigram(prior.as_ref(), token_ids, start, end);
-        out.push(sha256_to_i64(&digest));
+        out.push(encode(&digest));
         prior = Some(digest);
         start = end;
     }
@@ -229,9 +250,39 @@ fn chain_block_bigram(
     hasher.finalize().into()
 }
 
+fn digest_to_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_hashes_hex_cross_language_golden() {
+        // Python hashlib goldens: one full page and one partial chained page.
+        let tokens = [1, 2, 3, 4, 5, 6];
+        assert_eq!(
+            compute_block_hashes_hex(&tokens, 4),
+            [
+                "cf97adeedb59e05bfd73a2b4c2a8885708c4f4f70c84c64b27120e72ab733b72",
+                "ccb860d400a5043f4378cf6408132e442be724ef376ab2f53169b5d9e958f75f",
+            ]
+        );
+        assert_eq!(
+            compute_block_hashes_hex_bigram(&tokens, 4),
+            [
+                "f721fe42aac11dcbfd1a17f24cc5765a0d5b6bc264d1c0b6581d775a7344c11f",
+                "320610e667b94f99a141e1752a124d62805e754a5f7d50f8d8aefb0a2ec69b2e",
+            ]
+        );
+    }
 
     // ---- Bigram cross-language goldens ----
     // Values produced by SGLang's REAL `RadixKey(..., is_bigram=True).hash_page`

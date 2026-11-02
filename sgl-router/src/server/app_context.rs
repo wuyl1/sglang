@@ -7,6 +7,7 @@ use crate::discovery::ModelId;
 
 use crate::policies::buckets::BucketSelector;
 use crate::policies::PolicyRegistry;
+use crate::prefetch::UmbpPrefetchCoordinator;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
@@ -75,6 +76,7 @@ pub struct AppContext {
     /// Local KV tree for `--dp-aware` rank selection, under any policy.
     pub dp_rank_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    pub umbp_prefetch: Option<Arc<UmbpPrefetchCoordinator>>,
     /// Read-only handles `/metrics` pulls the KV storage-tier series from on
     /// scrape. `None` when this router maintains no local tree (external
     /// Indexer), where those series would all be a structural zero — see
@@ -146,6 +148,7 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            umbp_prefetch: None,
             kv_metrics: None,
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
@@ -254,6 +257,7 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            umbp_prefetch: None,
             kv_metrics: None,
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),

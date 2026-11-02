@@ -12,6 +12,7 @@ use sgl_router::{
     discovery::{spawn_discovery, ModelId},
     policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     policies_reorg::factory::build_resolver as build_reorg_resolver,
+    prefetch::UmbpPrefetchCoordinator,
     proxy::Proxy,
     server::{
         app::build_router,
@@ -58,6 +59,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
+    let umbp_prefetch = cli
+        .cache
+        .umbp_prefetch_config
+        .as_deref()
+        .map(UmbpPrefetchCoordinator::from_file)
+        .transpose()?
+        .map(Arc::new);
     let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
@@ -75,6 +83,18 @@ async fn main() -> Result<()> {
 
     // Monitor engine-reported KV-cache events and load statistics for routing.
     let engine_state = start_engine_state_monitor(&config, external_kv_indexer_client.is_some());
+    if let Some(prefetch) = &umbp_prefetch {
+        ensure!(
+            config.model.tokenizer_path.is_some(),
+            "UMBP prefetch requires a tokenizer"
+        );
+        engine_state
+            .block_size_oracle()
+            .try_set(prefetch.block_size())
+            .map_err(|mismatch| {
+                anyhow::anyhow!("UMBP prefetch block size mismatch: {mismatch:?}")
+            })?;
+    }
 
     // Build the policies that choose which workers receive each request.
     let (routing_policies, chat_routing, reorg_cleanup) = match routing {
@@ -140,6 +160,7 @@ async fn main() -> Result<()> {
         external_kv_indexer_client,
     )?;
     app_context.chat_routing = chat_routing;
+    app_context.umbp_prefetch = umbp_prefetch;
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
 

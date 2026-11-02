@@ -323,6 +323,25 @@ unset fields inherit the CLI flags. See
   prefix matches are kept per adapter; see
   [LoRA cache identity](REFERENCE.md#lora-cache-identity).
 
+### UMBP prefetch
+
+Add `--umbp-prefetch-config examples/umbp-prefetch.json` to submit prefetch
+to the selected worker's per-rank UMBP servers before forwarding. The router
+waits for acceptance; transfer and status polling run asynchronously. Failed
+submissions leave normal engine GET fallback available.
+
+Set `UMBP_PREFETCH_CONTROL_ADDRESS=host:port` on MoRI's standalone servers
+with the SubmitPrefetch/GetPrefetchStatus API (ROCm/mori#850). The worker URLs,
+`block_size` and physical `key_templates` must match the deployment. Templates
+require `{hash}` and may include `{rank}`; add templates for additional KV components.
+
+Only complete pages with confirmed engine input IDs are prefetched. Namespaced,
+multimodal and batched prompts are skipped. Configuration is opt-in and retains
+the image's `timeout_ms`, `lease_ttl_ms`, `poll_interval_ms`,
+`max_keys_per_request` and `submit_enabled` fields.
+Worker-reported hashing mode takes precedence. Without KV-event metadata,
+hashing defaults to ordinary tokens; set `is_bigram: true` for EAGLE bigram workers.
+
 ### Operations
 
 - **No tokenizer**: `--no-tokenizer` for load-only policies (`power_of_two`,

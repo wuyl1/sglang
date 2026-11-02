@@ -18,6 +18,7 @@ use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::state::kv_events::{compute_block_hashes_hex, compute_block_hashes_hex_bigram};
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
@@ -241,6 +242,45 @@ async fn dispatch<T: Transport>(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
+    if let Some(prefetch) = &ctx.umbp_prefetch {
+        if let Some(ids) = request.prefetch_token_ids(&body) {
+            let (block_size, bigram) = ctx
+                .block_size_oracle
+                .hash_config()
+                .unwrap_or_else(|| prefetch.hash_config());
+            let mut hashes = if bigram {
+                compute_block_hashes_hex_bigram(ids, block_size as usize)
+            } else {
+                compute_block_hashes_hex(ids, block_size as usize)
+            };
+            // Storage publishes complete pages; EAGLE hashes overlap by one token.
+            hashes.truncate(ids.len().saturating_sub(usize::from(bigram)) / block_size as usize);
+            let correlation_id = engine_rid
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let budget = ctx
+                .router_inflight_load
+                .stale_request_timeout()
+                .saturating_sub(request_started_at.elapsed());
+            // Acceptance precedes engine GET; expiry and caller cancellation still stop dispatch.
+            let submit = tokio::time::timeout(
+                budget,
+                prefetch.submit(&prefill.url, &hashes, &correlation_id),
+            );
+            let expired = tokio::select! {
+                biased;
+                _ = active_request_guard.cancel_token().cancelled() => true,
+                result = submit => result.is_err(),
+            };
+            if expired {
+                ctx.metrics
+                    .record_stale_request(StaleRequestOutcome::Expired);
+                return Err(ApiError::StaleRequestExpired {
+                    model: request.model.0.clone(),
+                });
+            }
+        }
+    }
     let prefill_leg = Leg::new(
         dp_aware,
         headers.clone(),

@@ -323,6 +323,10 @@ pub struct RoutingArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct CacheArgs {
+    /// JSON config mapping worker URLs to UMBP prefetch targets. Requires a tokenizer.
+    #[arg(long, conflicts_with = "no_tokenizer", value_name = "PATH")]
+    pub umbp_prefetch_config: Option<String>,
+
     /// Prefix-match source: indexer when --kv-indexer-endpoint is set, otherwise radix_tree.
     #[arg(long, value_enum)]
     pub cache_prefix_provider: Option<CachePrefixProvider>,

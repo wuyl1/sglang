@@ -1,0 +1,9 @@
+{
+  "worker_targets": {
+    "http://127.0.0.1:30000": [
+      {"rank": 0, "endpoint": "http://127.0.0.1:18100"}
+    ]
+  },
+  "block_size": 256,
+  "key_templates": ["model_{hash}_tp{rank}_cp0_pp0_kv"]
+}
