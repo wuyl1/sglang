@@ -47,6 +47,9 @@
 //! | `sgl_router_openai_route_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
+//! | `sgl_router_prefetch_total` | Counter | `outcome` |
+//! | `sgl_router_prefetch_acceptance_seconds` | Histogram | — |
+//! | `sgl_router_prefetch_completion_seconds` | Histogram | — |
 //!
 //! The tokenizer series are rendered by [`crate::tokenizer::stats::TokenizerStats`].
 //!
@@ -158,6 +161,27 @@ const TTFT_BUCKETS: &[f64] = &[
 /// spans ~16 tokens to ~512K tokens of forfeited prefix.
 const OVERLAP_BLOCK_BUCKETS: &[f64] = &[
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
+];
+
+const PREFETCH_OUTCOMES: &[&str] = &[
+    "evaluated",
+    "issued",
+    "reused",
+    "disabled",
+    "unmapped",
+    "short_prefix",
+    "budget",
+    "accepted",
+    "rejected",
+    "submit_error",
+    "ready",
+    "partial",
+    "failed",
+    "expired",
+    "observation_timeout",
+    "status_error",
+    "cooldown",
+    "ineligible",
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -487,6 +511,9 @@ pub struct MetricsRegistry {
     input_ids_forwarding_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     openai_route_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    prefetch_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    prefetch_acceptance_seconds: Mutex<Option<Histogram>>,
+    prefetch_completion_seconds: Mutex<Option<Histogram>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -952,6 +979,42 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a bounded Hint decision or UMBP prefetch outcome.
+    pub fn record_prefetch(&self, outcome: &'static str) {
+        if !PREFETCH_OUTCOMES.contains(&outcome) {
+            return;
+        }
+        let counter = self
+            .prefetch_total
+            .lock()
+            .entry(outcome)
+            .or_default()
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Time from submission to UMBP acceptance, in seconds.
+    pub fn observe_prefetch_acceptance(&self, seconds: f64) {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        self.prefetch_acceptance_seconds
+            .lock()
+            .get_or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS))
+            .observe(seconds);
+    }
+
+    /// Time from submission to an observed UMBP terminal state, in seconds.
+    pub fn observe_prefetch_completion(&self, seconds: f64) {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        self.prefetch_completion_seconds
+            .lock()
+            .get_or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS))
+            .observe(seconds);
     }
 
     /// Render the registry as a Prometheus 0.0.4 exposition-format string
@@ -1450,6 +1513,40 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        out.push_str(
+            "# HELP sgl_router_prefetch_total Hint decisions and UMBP prefetch outcomes.\n",
+        );
+        out.push_str("# TYPE sgl_router_prefetch_total counter\n");
+        let guard = self.prefetch_total.lock();
+        let mut entries: Vec<_> = guard
+            .iter()
+            .map(|(outcome, counter)| (*outcome, counter.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| entry.0);
+        for (outcome, count) in entries {
+            out.push_str(&format!(
+                "sgl_router_prefetch_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+        drop(guard);
+        for (name, help, histogram) in [
+            (
+                "sgl_router_prefetch_acceptance_seconds",
+                "Time from submission to UMBP acceptance, in seconds.",
+                &self.prefetch_acceptance_seconds,
+            ),
+            (
+                "sgl_router_prefetch_completion_seconds",
+                "Time from submission to an observed UMBP terminal state, in seconds.",
+                &self.prefetch_completion_seconds,
+            ),
+        ] {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+            if let Some(histogram) = histogram.lock().as_ref() {
+                render_histogram(&mut out, name, "", histogram);
+            }
+        }
+
         out
     }
 }
@@ -1483,19 +1580,29 @@ fn render_model_outcomes(
 }
 
 fn render_histogram(out: &mut String, name: &str, label_body: &str, hist: &Histogram) {
+    let prefix = if label_body.is_empty() {
+        String::new()
+    } else {
+        format!("{label_body},")
+    };
+    let labels = if label_body.is_empty() {
+        String::new()
+    } else {
+        format!("{{{label_body}}}")
+    };
     let mut cumulative: u64 = 0;
     for (i, &bound) in hist.bounds.iter().enumerate() {
         cumulative += hist.buckets[i];
         out.push_str(&format!(
-            "{name}_bucket{{{label_body},le=\"{bound}\"}} {cumulative}\n"
+            "{name}_bucket{{{prefix}le=\"{bound}\"}} {cumulative}\n"
         ));
     }
     cumulative += hist.buckets[hist.bounds.len()];
     out.push_str(&format!(
-        "{name}_bucket{{{label_body},le=\"+Inf\"}} {cumulative}\n"
+        "{name}_bucket{{{prefix}le=\"+Inf\"}} {cumulative}\n"
     ));
-    out.push_str(&format!("{name}_sum{{{label_body}}} {}\n", hist.sum));
-    out.push_str(&format!("{name}_count{{{label_body}}} {}\n", hist.count));
+    out.push_str(&format!("{name}_sum{labels} {}\n", hist.sum));
+    out.push_str(&format!("{name}_count{labels} {}\n", hist.count));
 }
 
 /// Prometheus label-value escape rule per

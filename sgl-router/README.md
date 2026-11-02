@@ -342,6 +342,27 @@ the image's `timeout_ms`, `lease_ttl_ms`, `poll_interval_ms`,
 Worker-reported hashing mode takes precedence. Without KV-event metadata,
 hashing defaults to ordinary tokens; set `is_bigram: true` for EAGLE bigram workers.
 
+Async Hint decisions use `min_prefix_blocks` (default 1) and
+`max_blocks_per_request` (4096). Per physical endpoint, `max_inflight_requests`
+(16) and `max_inflight_keys` (65536) bound speculative work. Optionally set
+`bytes_per_key` and `max_inflight_bytes` to cap estimated prefetch bytes; choose
+that cap below the DRAM pool size to leave room for demand LOAD. These are
+per-router static limits; UMBP makes the final capacity decision.
+
+Requests reuse outstanding endpoint/key submissions, including TP shared keys.
+Action IDs survive router retries; operation IDs bind endpoint, keys and options.
+Cancellation ends only that request's acceptance wait. Reservations retain budget
+through the execution/lease window, including ambiguous RPC outcomes, then reclaim
+metadata. The static window does not prove backend I/O has stopped.
+Normal GET remains authoritative; routing cache signals include pending
+and remote tiers, so local residency is checked by UMBP rather than inferred here.
+
+`sgl_router_prefetch_total{outcome}` records decisions and task outcomes; acceptance
+and observed completion latency have separate histograms. IDs appear only in logs.
+READY and `completed_keys` do not measure transferred bytes or Engine consumption.
+This stage supports async only; per-request wait policy and sync Engine execution
+require a later integration.
+
 ### Operations
 
 - **No tokenizer**: `--no-tokenizer` for load-only policies (`power_of_two`,

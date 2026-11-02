@@ -18,7 +18,6 @@ use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
 };
-use crate::state::kv_events::{compute_block_hashes_hex, compute_block_hashes_hex_bigram};
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
@@ -248,16 +247,8 @@ async fn dispatch<T: Transport>(
                 .block_size_oracle
                 .hash_config()
                 .unwrap_or_else(|| prefetch.hash_config());
-            let mut hashes = if bigram {
-                compute_block_hashes_hex_bigram(ids, block_size as usize)
-            } else {
-                compute_block_hashes_hex(ids, block_size as usize)
-            };
-            // Storage publishes complete pages; EAGLE hashes overlap by one token.
-            hashes.truncate(ids.len().saturating_sub(usize::from(bigram)) / block_size as usize);
-            let correlation_id = engine_rid
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let hashes = prefetch.hashes(ids, (block_size, bigram));
+            let action_id = request.hint_action_id();
             let budget = ctx
                 .router_inflight_load
                 .stale_request_timeout()
@@ -265,7 +256,7 @@ async fn dispatch<T: Transport>(
             // Acceptance precedes engine GET; expiry and caller cancellation still stop dispatch.
             let submit = tokio::time::timeout(
                 budget,
-                prefetch.submit(&prefill.url, &hashes, &correlation_id),
+                prefetch.submit(&prefill.url, &hashes, action_id, &ctx.metrics),
             );
             let expired = tokio::select! {
                 biased;
@@ -279,6 +270,9 @@ async fn dispatch<T: Transport>(
                     model: request.model.0.clone(),
                 });
             }
+        } else {
+            ctx.metrics.record_prefetch("evaluated");
+            ctx.metrics.record_prefetch("ineligible");
         }
     }
     let prefill_leg = Leg::new(

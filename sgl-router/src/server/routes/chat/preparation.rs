@@ -109,6 +109,8 @@ pub(super) struct PreparedRequest {
     input_ids_forwarding: Option<InputIdsForwarding>,
     /// Set by the first outgoing body, so a retry does not book it again.
     forwarding_booked: bool,
+    /// One logical hint across dispatch retries; allocated only when prefetch is eligible.
+    hint_action_id: Option<String>,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
@@ -249,6 +251,7 @@ impl PreparedRequest {
                 || (path == COMPLETIONS_PATH && fields.prompt_batch),
             input_ids_forwarding: forwarding,
             forwarding_booked: false,
+            hint_action_id: None,
             parsed_body,
             sampling_defaults,
             responder: None,
@@ -309,6 +312,7 @@ impl PreparedRequest {
             fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
             input_ids_forwarding: None,
             forwarding_booked: false,
+            hint_action_id: None,
             responder: None,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
@@ -403,6 +407,7 @@ impl PreparedRequest {
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            hint_action_id: None,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
@@ -523,6 +528,7 @@ impl PreparedRequest {
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            hint_action_id: None,
             responder: None,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
@@ -557,6 +563,7 @@ impl PreparedRequest {
             fans_out: false,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            hint_action_id: None,
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
@@ -605,6 +612,11 @@ impl PreparedRequest {
                 .zip(&tokens.ids)
                 .all(|(id, &token)| id.as_u64() == Some(u64::from(token))))
         .then_some(tokens.ids.as_slice())
+    }
+
+    pub(super) fn hint_action_id(&mut self) -> &str {
+        self.hint_action_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
@@ -1647,6 +1659,17 @@ mod tests {
     fn prepare_generate(body: Value) -> PreparedRequest {
         let body = Bytes::from(body.to_string());
         PreparedRequest::generate(&tokenizer_ctx(), ModelId("stub-model".into()), body).unwrap()
+    }
+
+    #[test]
+    fn hint_identity_is_lazy_and_survives_dispatch_retries() {
+        let mut request = prepare_generate(json!({"input_ids": [1], "rid": "caller"}));
+        assert!(request.hint_action_id.is_none());
+        assert!(request.engine_rid().is_none());
+        let first = request.hint_action_id().to_owned();
+        assert_eq!(request.hint_action_id(), first);
+        let mut other = prepare_generate(json!({"input_ids": [1], "rid": "caller"}));
+        assert_ne!(other.hint_action_id(), first);
     }
 
     #[test]
