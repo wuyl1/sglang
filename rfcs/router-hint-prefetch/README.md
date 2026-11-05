@@ -77,16 +77,16 @@ The case creates remote reuse through session migration:
 
 1. A session initially runs on P0. Strict-local PUT keeps its offloaded previous-turn KV in P0's owner, while shared metadata makes it readable from P1.
 2. An experimental `session_chbl` routing policy moves a later request to P1 when P0's waiting-uncached tokens exceed 4,096 and its load gap to the least-loaded P exceeds 5%, with a 20 s repin cooldown. Real HTTP load polls drive the decision; stale/missing state disables migration.
-3. **Share, prefetch off:** P1 obtains reusable KV from P0 through normal demand remote GET.
-4. **Share + prefetch:** after selecting P1, the Router submits to P1's owner. UMBP prepares available P0 KV in P1 DRAM through RDMA before normal LOAD needs it.
+3. **Share:** P1 obtains reusable KV from P0 through normal demand remote GET during Engine LOAD.
+4. **Prefetch:** after selecting P1, the Router submits to P1's owner before forwarding. UMBP prepares available P0 KV in P1 DRAM through RDMA so normal LOAD can reuse it.
 
-This routing policy is an experiment overlay used identically in both arms, not a requirement of prefetch. Ordinary cross-node sharing remains enabled when prefetch is off. Both arms hash the same request tokens; only submission changes.
+This routing policy is an experiment overlay used identically in both arms, not a requirement of prefetch. **Share and Prefetch both retain cross-node sharing** and hash the same request tokens; only Prefetch enables Router prefetch submission before forwarding.
 
 AgentX replays from turn0 at concurrency 48, seed42, for a 1,200 s sending window with a 300 s ramp and no warmup. Model KV caches and both owner pools are cleared before each arm; the same image, Router binary, and model processes are reused.
 
 The **no-share** arm preserves local caching, session migration, and normal P → D GPU KV transfer. Each P owner uses an independent Master, with Router and Engine prefetch disabled; audits confirmed zero remote cache-read bytes.
 
-| Metric | No share | Share, prefetch off | Share + prefetch | Prefetch vs. share |
+| Metric | No share | Share | Prefetch | Prefetch vs. Share |
 | --- | ---: | ---: | ---: | ---: |
 | TTFT P50 | 1.024 s | 0.563 s | 0.497 s | **−11.74%** |
 | TTFT P90 | 5.530 s | 2.137 s | 2.125 s | −0.58% |
