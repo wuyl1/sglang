@@ -23,7 +23,7 @@ The measurements below validate the initial UMBP Prefetch path. Other operations
 
 Demand LOAD may need KV that has been offloaded to SSD or remains on a previous session worker. Starting the read in the Router creates an opportunity to overlap I/O with request delivery and Engine queueing. Prefetch begins after the request arrives and its destination is known.
 
-<img src="assets/hint-flow-horizontal.en.png" alt="Router Hint architecture: implemented async UMBP prefetch and planned extensions" width="900">
+<img src="assets/hint-flow-horizontal.en.png" alt="Router Hint architecture: async endpoint submission and planned in-band request hints" width="900">
 
 **Scope of the diagram:** the direct async UMBP path is implemented and benchmarked for SSD → DRAM and remote-node → local DRAM. The sync/in-band path, execution of the community-proposed Share/Pin/Demote/Retain actions, Mooncake adapter, and consumed-KV attribution remain follow-up work.
 
