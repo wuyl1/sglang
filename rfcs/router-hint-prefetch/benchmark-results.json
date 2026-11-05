@@ -432,6 +432,7 @@
         "p99": 12.985194526650002
       },
       "input_tok_s": 165340.90573259792,
+      "output_tok_s": 1659.051437194326,
       "remote_bytes": 0.0,
       "same_physical_nodes_as_share_pair": false,
       "limitations": "One descriptive three-arm comparison using the same image and routing policy. No-share uses different physical nodes or roles; placement and node effects are confounded. No-share uses fresh model processes with 900 s conditioning and independent Masters. All formal arms use a cold KV reset and the same 1200 s replay with a 300 s ramp. It is not a comparison with a pure-hash no-migration router."

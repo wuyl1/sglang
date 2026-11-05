@@ -82,15 +82,19 @@ This routing policy is an experiment overlay used identically in both arms, not 
 
 AgentX replays from turn0 at concurrency 48, seed42, for a 1,200 s sending window with a 300 s ramp and no warmup. Model KV caches and both owner pools are cleared before each arm; the same image, Router binary, and model processes are reused.
 
-| Metric | Share, prefetch off | Share + prefetch | Change |
-| --- | ---: | ---: | ---: |
-| TTFT P50 | 0.563 s | 0.497 s | **−11.74%** |
-| TTFT P90 | 2.137 s | 2.125 s | −0.58% |
-| TTFT P99 | 5.735 s | 5.264 s | **−8.21%** |
-| Input throughput | 170,159.1 tok/s | 170,541.1 tok/s | +0.22% |
-| Output throughput | 1,710.5 tok/s | 1,711.9 tok/s | +0.09% |
+The **no-share** arm preserves local caching, session migration, and normal P → D GPU KV transfer. Each P owner uses an independent Master, with Router and Engine prefetch disabled; audits confirmed zero remote cache-read bytes.
 
-This pair shows an **additional TTFT benefit over ordinary sharing**, with essentially unchanged throughput. It retained 2,473/2,476 complete records, zero request errors, and 100% reported timing coverage. Each arm canceled three outstanding requests at the common end-of-phase limit. TTFT percentiles were independently recomputed; an invalid initial on attempt was excluded and replaced after correcting client configuration delivery.
+| Metric | No share | Share, prefetch off | Share + prefetch | Prefetch vs. share |
+| --- | ---: | ---: | ---: | ---: |
+| TTFT P50 | 1.024 s | 0.563 s | 0.497 s | **−11.74%** |
+| TTFT P90 | 5.530 s | 2.137 s | 2.125 s | −0.58% |
+| TTFT P99 | 12.985 s | 5.735 s | 5.264 s | **−8.21%** |
+| Input throughput | 165,340.9 tok/s | 170,159.1 tok/s | 170,541.1 tok/s | +0.22% |
+| Output throughput | 1,659.1 tok/s | 1,710.5 tok/s | 1,711.9 tok/s | +0.09% |
+
+The three arms show the observed trend; no-share ran on a separate node allocation. The last column compares the matched sharing arms.
+
+The matched sharing pair shows an **additional TTFT benefit over ordinary sharing**, with essentially unchanged throughput. It retained 2,473/2,476 complete records, zero request errors, and 100% reported timing coverage. Each arm canceled three outstanding requests at the common end-of-phase limit. TTFT percentiles were independently recomputed; an invalid initial on attempt was excluded and replaced after correcting client configuration delivery.
 
 On accepted 1,873 prefetch tasks, completing 1,241,167 key entries across tasks. Outcomes were 54 READY, 1,102 PARTIAL, and 717 FAILED. A batch can include unavailable cold/new-turn keys; these counts describe tasks, not unique keys, useful-prefetch coverage, or inference errors.
 
@@ -159,7 +163,7 @@ We also performed a [real RDMA functional check](benchmark-results.json): prefet
 
 For integration checks, use Router decisions/task logs to establish submission, backend counters to confirm the intended SSD/RDMA path, and byte checks to verify the copy. Measure request TTFT/throughput separately: **accepted or READY tasks alone do not prove inference benefit**. Per-request attribution of consumed prefetched KV remains a follow-up.
 
-The tables are observed matched comparisons, without a statistical-significance claim. The cross-node migration result is one valid pair. Nine additional cold-prefix burst pairs showed small, variable improvements; their pooled P99 increased 7.38%. A separate no-share control verified zero remote reads but used different physical nodes, so its larger latency gap is not used to quantify prefetch's benefit. These tests also do not isolate Router triggering versus Engine triggering. Total SSD/remote GET counters include demand and prefetch activity.
+The tables report observed results, without a statistical-significance claim. The cross-node migration prefetch result is one valid pair. Nine additional cold-prefix burst pairs showed small, variable improvements; their pooled P99 increased 7.38%. These tests also do not isolate Router triggering versus Engine triggering. Total SSD/remote GET counters include demand and prefetch activity.
 
 ## Proposed upstream scope
 
