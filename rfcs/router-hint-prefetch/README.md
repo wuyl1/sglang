@@ -1,6 +1,6 @@
 # [RFC] Router Hint Module for KV Cache Operations
 
-**Authors:** [@wuyl1](https://github.com/wuyl1), [@TianDi101](https://github.com/TianDi101), Feiyue Zhai (`Feiyue.Zhai@amd.com`).
+**Authors:** [@TianDi101](https://github.com/TianDi101), Feiyue Zhai (`Feiyue.Zhai@amd.com`), [@wuyl1](https://github.com/wuyl1).
 
 **Contributions:** @TianDi101 provided the initial cross-tier prefetch implementation; Feiyue Zhai contributed the cross-node sharing idea and implementation.
 
