@@ -1,0 +1,451 @@
+{
+  "description": "Summarized retained measurements for the Router Hint RFC. Full per-request exports and runtime audits remain in the local experiment archive.",
+  "model": "deepseek-ai/DeepSeek-V4-Pro-0813",
+  "gpu": "AMD Instinct MI355X",
+  "dataset": {
+    "source_type": "public_dataset",
+    "loader": "semianalysis_cc_traces_weka_062126",
+    "hf_dataset_name": "semianalysisai/cc-traces-weka-062126",
+    "hf_split": "train",
+    "num_dataset_entries": 393
+  },
+  "software": {
+    "router_revision": "d8f304f6b34e1f05a6c216e6b5b7952512b1b281",
+    "router_upstream_base": "b45a36531c3673048aeaf35322c3df7f18edd038",
+    "engine": {
+      "version": "0.5.21.dev20261007+gaa5551d9b6",
+      "preserved_patches": [
+        "730eba35 parallel LOAD",
+        "7e570507 queue prefetch (disabled)",
+        "031f5ce3 intake reject",
+        "fb7926a4 shared CP keys"
+      ]
+    },
+    "mori_revision": "7a51c1187b751a811155d86b474dac5309bd789c",
+    "mori_pr_heads": {
+      "824": "de8dae50ee24cdd179e76445e1291eb6971a9599",
+      "850": "f06fe45e64b65f76a7b1fe1448ec5a24f7987bfd",
+      "887": "73c712737b8bf096bc48777de9ce3f99c19c9c4e",
+      "888": "aa5991513118b03a48e3ec138d4ad2073dbf6aa9"
+    },
+    "mori_small_object_patch_sha256": "bbccb700d6f7de113f718684456aa70c1e1d4b585cade26d88ba7a0610a1ac0f",
+    "runtime": {
+      "python": "3.12.3",
+      "torch": "2.11.0+rocm7.2",
+      "torch_hip": "7.2.26015"
+    },
+    "aiperf_source_revision": "89b21867872a5bbc4b0676bf5005c404da5e9f94",
+    "cross_node_client_fix": {
+      "patch_sha256": "d152cd4d373fd52f6d2b1dac4e51224ec0ef081e717f322349374adfe8f7a0e5",
+      "scope": "registration and dataset configuration delivery; trace, request, timing and metric computations preserved",
+      "baseline_off_valid": true
+    },
+    "session_router_overlay": {
+      "base": "d8f304f6b34e1f05a6c216e6b5b7952512b1b281",
+      "binary_sha256": "a28db6309e7299220d788c0249990f855f7965e507c40572394a152e14c9a1fb",
+      "source_sha256": {
+        "sgl-router/src/config/cli.rs": "cb26dbaa052c848a696d476a27598a84d1fbc816b46453a48fada0ee3a1c4781",
+        "sgl-router/src/config/types.rs": "98604c6e43b8616fcdab2467ec5f521fed0475330e5821eececc7ed646856ab9",
+        "sgl-router/src/policies/factory.rs": "35ab0228fd61100eca6b7afc9a60639ba06125966af653276d9f577b01878cb0",
+        "sgl-router/src/policies/mod.rs": "91d74abe0247fd91db7344d867dc8b1af60d8ab150672f4e81aab55945bc0348",
+        "sgl-router/src/policies/session_chbl.rs": "1aed88ae7abf8d4edc33e18543ef2164d0198ae727db239577b301186694d24c"
+      }
+    }
+  },
+  "cross_tier": {
+    "send_duration_s": 3600,
+    "topology": "1P1D: P TP4, D TP8",
+    "engine_queue_prefetch": false,
+    "prefetch_switch": "Router submit_enabled",
+    "capacity_unit": "decimal GB",
+    "pairs": [
+      {
+        "case": "c64-750-750",
+        "concurrency": 64,
+        "dram_gb": 750,
+        "ssd_gb": 750,
+        "arms": {
+          "off": {
+            "input_tokens_s": 329424.37981,
+            "ttft_seconds": {
+              "p50": 2.36342,
+              "p90": 10.22784,
+              "p99": 27.696533451680004
+            },
+            "completed": 8967,
+            "cancelled": 4,
+            "failed": 0
+          },
+          "on": {
+            "input_tokens_s": 332480.17916,
+            "ttft_seconds": {
+              "p50": 2.1644,
+              "p90": 8.84926,
+              "p99": 30.492854938760033
+            },
+            "completed": 9049,
+            "cancelled": 3,
+            "failed": 0
+          }
+        }
+      },
+      {
+        "case": "c64-750-750-repeat",
+        "concurrency": 64,
+        "dram_gb": 750,
+        "ssd_gb": 750,
+        "arms": {
+          "off": {
+            "input_tokens_s": 327489.20963,
+            "ttft_seconds": {
+              "p50": 2.52521,
+              "p90": 9.82188,
+              "p99": 30.68261247234
+            },
+            "completed": 8918,
+            "cancelled": 7,
+            "failed": 0
+          },
+          "on": {
+            "input_tokens_s": 333043.48357,
+            "ttft_seconds": {
+              "p50": 1.98297,
+              "p90": 9.98445,
+              "p99": 28.25746072390009
+            },
+            "completed": 9039,
+            "cancelled": 4,
+            "failed": 0
+          }
+        }
+      },
+      {
+        "case": "c64-500-1000",
+        "concurrency": 64,
+        "dram_gb": 500,
+        "ssd_gb": 1000,
+        "arms": {
+          "off": {
+            "input_tokens_s": 325766.77162,
+            "ttft_seconds": {
+              "p50": 2.75217,
+              "p90": 10.32207,
+              "p99": 28.777131732249998
+            },
+            "completed": 8876,
+            "cancelled": 9,
+            "failed": 0
+          },
+          "on": {
+            "input_tokens_s": 333658.47015,
+            "ttft_seconds": {
+              "p50": 2.01382,
+              "p90": 9.09354,
+              "p99": 26.956655721200132
+            },
+            "completed": 9066,
+            "cancelled": 3,
+            "failed": 0
+          }
+        }
+      },
+      {
+        "case": "c192-750-750",
+        "concurrency": 192,
+        "dram_gb": 750,
+        "ssd_gb": 750,
+        "arms": {
+          "off": {
+            "input_tokens_s": 777802.6521,
+            "ttft_seconds": {
+              "p50": 4.09021,
+              "p90": 11.42234,
+              "p99": 39.643297665599995
+            },
+            "completed": 20871,
+            "cancelled": 45,
+            "failed": 0
+          },
+          "on": {
+            "input_tokens_s": 789870.46779,
+            "ttft_seconds": {
+              "p50": 4.05267,
+              "p90": 11.30181,
+              "p99": 38.8648430399498
+            },
+            "completed": 21146,
+            "cancelled": 30,
+            "failed": 0
+          }
+        }
+      }
+    ]
+  },
+  "cross_node": {
+    "topology": "2P1D: P TP4, D TP8, DP1",
+    "dram_gib_per_prefill": 512,
+    "ssd_enabled": false,
+    "strict_local_put": true,
+    "direct_pool_get": true,
+    "remote_recache": true,
+    "concurrency": 48,
+    "random_seed": 42,
+    "send_duration_s": 1200,
+    "concurrency_ramp_s": 300,
+    "warmup_requests": 0,
+    "kv_reset_before_each_arm": true,
+    "engine_queue_prefetch": false,
+    "routing": {
+      "policy": "session_chbl experiment overlay",
+      "waiting_uncached_token_threshold": 4096,
+      "relative_load_gap_threshold": 0.05,
+      "repin_cooldown_s": 20,
+      "stale_or_missing_load_disables_migration": true
+    },
+    "rows": [
+      {
+        "mode": "off",
+        "completed": 2473,
+        "cancelled": 3,
+        "duration_s": 1222.374271488,
+        "ttft_s": {
+          "p50": 0.563016255,
+          "p90": 2.1373800588000003,
+          "p99": 5.734894484240011
+        },
+        "input_tok_s": 170159.13295306065,
+        "output_tok_s": 1710.4880658447578,
+        "requests_s": 1.994340924099766,
+        "functional": {
+          "arm": "off",
+          "wall_s": 1290.3004849909921,
+          "migration_events": 147,
+          "prefetch_accepted": 0,
+          "prefetch_ready": 0,
+          "remote_bytes": 114214182144.0,
+          "later_turn_migrations": 132,
+          "completed_prefetch_keys": 0,
+          "prefetch_states": {}
+        },
+        "errors": 0,
+        "submission_valid": true,
+        "duration_coverage": [
+          {
+            "phase_name": "profiling",
+            "expected_duration_seconds": 1200.0,
+            "required_ratio": 0.95,
+            "ttft_ratio": 1.0,
+            "inter_token_latency_ratio": 1.0
+          }
+        ]
+      },
+      {
+        "mode": "on",
+        "completed": 2476,
+        "cancelled": 3,
+        "duration_s": 1226.716686336,
+        "ttft_s": {
+          "p50": 0.49690779649999994,
+          "p90": 2.124879558,
+          "p99": 5.2639333385
+        },
+        "input_tok_s": 170541.13205379873,
+        "output_tok_s": 1711.943362381845,
+        "requests_s": 1.9967598672794262,
+        "functional": {
+          "arm": "on-retry",
+          "wall_s": 1290.3053437839844,
+          "migration_events": 155,
+          "prefetch_accepted": 1873,
+          "prefetch_ready": 54,
+          "remote_bytes": 60954227200.0,
+          "later_turn_migrations": 143,
+          "completed_prefetch_keys": 1241167,
+          "prefetch_states": {
+            "5": 717,
+            "4": 1102,
+            "3": 54
+          }
+        },
+        "errors": 0,
+        "submission_valid": true,
+        "duration_coverage": [
+          {
+            "phase_name": "profiling",
+            "expected_duration_seconds": 1200.0,
+            "required_ratio": 0.95,
+            "ttft_ratio": 1.0,
+            "inter_token_latency_ratio": 1.0
+          }
+        ]
+      }
+    ],
+    "on_vs_off_changes_percent": {
+      "ttft_pct": {
+        "p50": -11.741838341772215,
+        "p90": -0.584851568560929,
+        "p99": -8.212202456980744
+      },
+      "input_tok_s_pct": 0.22449520875464923,
+      "output_tok_s_pct": 0.08508077701019356,
+      "requests_s_pct": 0.12129035464445437
+    },
+    "control_validation": {
+      "passed": true,
+      "request_argv_equal_except_artifact_path": true,
+      "client_environment_equal": true,
+      "router_config_equal_except_submit_enabled": true
+    },
+    "measurement_validation": {
+      "off": {
+        "client_records": 2473,
+        "ttft_percentiles_recomputed": true,
+        "complete_records_cancelled_or_skipped": 0,
+        "master_remote_counter_scrapes": 258,
+        "master_remote_counter_resets": [],
+        "failure_series_at_end": []
+      },
+      "on-retry": {
+        "client_records": 2476,
+        "ttft_percentiles_recomputed": true,
+        "complete_records_cancelled_or_skipped": 0,
+        "master_remote_counter_scrapes": 258,
+        "master_remote_counter_resets": [],
+        "failure_series_at_end": []
+      }
+    },
+    "invalid_initial_on_attempt_excluded": true,
+    "limitations": "One descriptive matched pair. Historical P TP8 numbers are external references; identical routing policy, shared DRAM and direct GET in both arms. Initial KV cold; model processes reused."
+  },
+  "additional_checks": {
+    "functional_rdma": {
+      "objects": 8,
+      "ready_observed": true,
+      "transferred_bytes": 4320256,
+      "complete_byte_check_passed": true,
+      "subsequent_local_get_added_no_rdma": true,
+      "verification_source": "Frozen driver/helper receipts retained with the cold-prefix run."
+    },
+    "cold_prefix_bursts": {
+      "pairs": 9,
+      "bursts": 18,
+      "requests": 1152,
+      "summary": {
+        "ttft_p50_s": {
+          "off_median": 1.875652014510706,
+          "on_median": 1.7490919069969095,
+          "paired_change_percent": {
+            "median": -5.379997485593869,
+            "q25": -13.708227018593478,
+            "q75": 0.7596660152084489
+          },
+          "improved_pairs": 6,
+          "pairs": 9
+        },
+        "ttft_p90_s": {
+          "off_median": 2.1208354523638264,
+          "on_median": 2.079156725772191,
+          "paired_change_percent": {
+            "median": -0.9649591836244809,
+            "q25": -3.9244967598818348,
+            "q75": 3.4051867378583234
+          },
+          "improved_pairs": 6,
+          "pairs": 9
+        },
+        "ttft_p99_s": {
+          "off_median": 2.227967158759711,
+          "on_median": 2.1475312990805833,
+          "paired_change_percent": {
+            "median": -1.6887044695636955,
+            "q25": -4.572308898518129,
+            "q75": 2.282553017106048
+          },
+          "improved_pairs": 6,
+          "pairs": 9
+        },
+        "requests_per_s": {
+          "off_median": 25.04205850901297,
+          "on_median": 26.128516468701438,
+          "paired_change_percent": {
+            "median": 2.091856931294589,
+            "q25": -2.526365619392812,
+            "q75": 4.6823542276798635
+          },
+          "improved_pairs": 6,
+          "pairs": 9
+        },
+        "output_tokens_per_s": {
+          "off_median": 801.3458722884151,
+          "on_median": 836.112526998446,
+          "paired_change_percent": {
+            "median": 2.091856931294589,
+            "q25": -2.526365619392812,
+            "q75": 4.6823542276798635
+          },
+          "improved_pairs": 6,
+          "pairs": 9
+        }
+      },
+      "pooled": {
+        "scope": "Descriptive TTFT of 576 correlated requests per arm; seed excluded",
+        "arms": {
+          "off": {
+            "requests": 576,
+            "ttft_s": {
+              "50": 1.93016288545914,
+              "90": 2.779324491508305,
+              "99": 3.181408574033412
+            }
+          },
+          "on": {
+            "requests": 576,
+            "ttft_s": {
+              "50": 1.7831373705121223,
+              "90": 2.792532317514997,
+              "99": 3.4160836544906488
+            }
+          }
+        },
+        "on_vs_off_ttft_percent": {
+          "50": -7.61725945797801,
+          "90": 0.4752171272928374,
+          "99": 7.376452127923772
+        }
+      },
+      "limitations": [
+        "Requests share one prefix; nine burst pairs, not 576 independent cold starts per arm.",
+        "Paired repetitions may be correlated within rounds; changes are descriptive.",
+        "Burst and pooled TTFT quantiles are descriptive, not stable production P99. No bootstrap significance claim.",
+        "Rates are client short-burst completion rates, including thread/barrier setup; not steady-state throughput.",
+        "Resolve/route rows, readback digests and restored meminfo are not saved; those checks rely on frozen driver/helper receipts.",
+        "Total RDMA includes foreground GET; exact-key prefetch advance time is unavailable."
+      ]
+    },
+    "no_share_control": {
+      "completed": 2428,
+      "cancelled": 3,
+      "errors": 0,
+      "ttft_s": {
+        "p50": 1.023761277,
+        "p90": 5.530288290399999,
+        "p99": 12.985194526650002
+      },
+      "input_tok_s": 165340.90573259792,
+      "remote_bytes": 0.0,
+      "same_physical_nodes_as_share_pair": false,
+      "limitations": "One descriptive three-arm comparison using the same image and routing policy. No-share uses different physical nodes or roles; placement and node effects are confounded. No-share uses fresh model processes with 900 s conditioning and independent Masters. All formal arms use a cold KV reset and the same 1200 s replay with a 300 s ramp. It is not a comparison with a pure-hash no-migration router."
+    }
+  },
+  "source_artifact_sha256": {
+    "cross_tier": "4e89cd7df8a629fc4c7df5e2799adbd6c5c0bb31d54e27c1171a97fac9ccbe51",
+    "cross_tier_repeat": "6e637dd5c0d9e6589c82c675e0eedef6274a0e02fc004fb473edda7824582d8e",
+    "cross_node": "6e95f2f779c74bd176e6c5794880fc11b00a6d29601de2c9a3ec76d3f15f6018",
+    "cross_node_control_audit": "74ace3b740bd02322c3a476ae29a17b11ce652ac12914a53b3379e3dba863e41",
+    "cross_node_measurement_audit": "9b8da9593dac7d964a77ccdf966d7bec61379ce47165f32db1639362e5443df4",
+    "no_share": "882bc0c9fd02def7ddf63556acb59b4c6ccac41925f7aa3a5e691917ba048764",
+    "cold_prefix": "9f66b4b2eab9bfc42e43d6ef2137781bb4457f8eefe600b2b56c17d69cf08d82",
+    "benchmark_image": "7cbe545606ad71ef4f717f4de3e779b37195f20b4e12b88ca4009f93e32e2edc",
+    "session_router_overlay": "72b4f23a49449a5272563dea3e045e0a16e6cb432494b8fb0b1acc31d5e5ce49"
+  }
+}

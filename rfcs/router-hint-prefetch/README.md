@@ -1,0 +1,208 @@
+# [RFC] Router Hint Module: Async KV Prefetch with UMBP
+
+Status: draft for author review · 2026-11-05
+
+## Summary
+
+We propose upstreaming the **implemented async KV prefetch path** as the first capability of a small Hint module in SGLang Router. After the routing policy selects a worker, the Router submits reusable prefix keys to that worker's UMBP backend before forwarding the request. UMBP prepares the KV in local DRAM from SSD or another node while the Engine proceeds through its normal request queue and LOAD path.
+
+The implementation is available in [wuyl1/sglang:feat/router-umbp-prefetch](https://github.com/wuyl1/sglang/tree/feat/router-umbp-prefetch), at [commit d8f304f6](https://github.com/wuyl1/sglang/commit/d8f304f6b34e1f05a6c216e6b5b7952512b1b281). We have exercised both storage paths with DeepSeek-V4-Pro-0813 on AMD MI355X:
+
+- **Cross-tier SSD → DRAM:** four matched comparisons observed input-throughput gains of **0.93%–2.42%**. The C64 500/1,000 GB pair reduced TTFT P50 by **26.83%** and P99 by **6.33%**.
+- **Cross-node session migration:** compared with ordinary sharing with prefetch disabled, Router prefetch reduced TTFT P50 by **11.74%** and P99 by **8.21%**, with input throughput essentially unchanged (**+0.22%**).
+
+This RFC focuses on the existing functionality, its integration boundary, and these test cases. Broader Hint actions are a follow-up.
+
+## Implemented request flow
+
+Demand LOAD may need KV that has been offloaded to SSD or remains on a previous session worker. Starting the read in the Router creates an opportunity to overlap I/O with request delivery and Engine queueing. Prefetch begins after the request arrives and its destination is known.
+
+```mermaid
+flowchart TB
+    subgraph Router["SGLang Router"]
+        R["Receive and tokenize request"] --> S["Routing policy selects final worker"]
+        subgraph Hint["Hint module: implemented async prefetch"]
+            K["Hash bounded complete prefix blocks"]
+            D{"Enabled, eligible, and target mapped?"}
+            B["Expand/deduplicate keys; reuse in-flight tasks; apply pool budget"]
+            A["SubmitPrefetch to target UMBP; await bounded submission result"]
+            K --> D
+            D -->|yes| B --> A
+        end
+        S --> K
+        D -->|skip| F["Forward request"]
+        B -->|budget skip| F
+        A --> F
+    end
+    subgraph Backend["UMBP"]
+        T["Async transfer: SSD or remote node to target local DRAM"]
+        V["GetPrefetchStatus: READY / PARTIAL / FAILED / EXPIRED"]
+        T --> V
+    end
+    subgraph Engine["Selected Engine"]
+        Q["Receive request and queue"] --> L["Normal LOAD to GPU and inference"]
+        L --> O["Return output"]
+    end
+    A -.-> T
+    A -.->|background polling| V
+    F --> Q
+    T -.->|available KV reused by LOAD| L
+```
+
+**The Router waits for submission resolution, not READY.** Transfer and status polling continue in background tasks. Rejection or an uncertain submission leaves normal Engine LOAD available. Backend-local READY means complete KV is available in UMBP DRAM; Engine LOAD still restores it into GPU memory.
+
+The Hint boundary owns decisions, submission, and observation for the selected destination. Routing policies retain worker selection and forwarding. In PD, current-prompt prefetch targets P; the normal P → D GPU KV transfer is a separate path.
+
+### Capabilities already present
+
+| Capability | Current behavior |
+| --- | --- |
+| Prefix/key mapping | Uses request tokens, Engine-compatible block hashes, and configured component key templates. Only complete, bounded prefix blocks are considered. |
+| Async control API | Calls UMBP `SubmitPrefetch` and `GetPrefetchStatus`; tracks request IDs and terminal task outcomes. |
+| Shared work | Groups targets by physical endpoint, deduplicates identical TP keys, and reuses in-flight work for overlapping requests. |
+| Bounded speculation | Caps prefix blocks, keys per RPC, and active batches/keys per endpoint; supports an optional static byte estimate. UMBP makes the final capacity/residency checks. |
+| Retry and lifecycle | Stable action/operation IDs bind the target, keys, and options. Shared tasks survive individual request cancellation; reservations and metadata are retired within bounded lifetimes. Historical READY is not treated as permanent residency. |
+| Observation | Records evaluated/skip reasons, issued/reused/accepted tasks, rejection and RPC errors, terminal states, acceptance/completion timing, and backend queue/execution timing. |
+
+Clients send ordinary inference requests; **no client-supplied `kv_hints` is required**. Direct key generation must match the Engine tokenizer, block/hash mode, model identity, and cache layout. The current path skips requests with `cache_salt` or `extra_key`. UMBP checks actual residency; a routing snapshot is not treated as proof of local DRAM availability.
+
+## Performance and test cases
+
+The benchmark image combines the Router branch with MoRI async prefetch, strict-local PUT, and direct pool GET ([#850](https://github.com/ROCm/mori/pull/850), [#887](https://github.com/ROCm/mori/pull/887), [#888](https://github.com/ROCm/mori/pull/888)). It also retains the existing Engine external-linker/parallel-LOAD patches. Each matched pair uses the same software, nodes, routing, and workload, with Engine queue-triggered prefetch disabled. The switch is Router `submit_enabled`.
+
+### Case 1: reusable agentic prefixes in SSD and DRAM
+
+One TP4 prefill Engine and one TP8 decode Engine run on two nodes. AgentX replays long-context conversations with the report's local DRAM/SSD placement policy. Each arm sends for 3,600 seconds; C64/C192 indicate request concurrency. Capacities are decimal GB, and backend placement weights are held fixed within each pair.
+
+1. Earlier turns populate KV across local DRAM and SSD. A later request reuses prefix blocks whose KV may remain on SSD.
+2. **Prefetch off:** normal Engine LOAD reads the needed KV on demand.
+3. **Prefetch on:** the Router submits prefix keys before forwarding; UMBP moves available SSD KV into DRAM so LOAD can reuse it.
+
+| Concurrency; DRAM / SSD | Input throughput off → on (tok/s) | Change | TTFT P50 change | P90 change | P99 change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| C64; 750 / 750 GB | 329,424.38 → 332,480.18 | +0.93% | −8.42% | −13.48% | **+10.10%** |
+| C64; 750 / 750 GB, repeat | 327,489.21 → 333,043.48 | +1.70% | −21.47% | +1.66% | −7.90% |
+| C64; 500 / 1,000 GB | 325,766.77 → 333,658.47 | **+2.42%** | **−26.83%** | −11.90% | −6.33% |
+| C192; 750 / 750 GB | 777,802.65 → 789,870.47 | +1.55% | −0.92% | −1.06% | −1.96% |
+
+For C64 500/1,000 GB, TTFT P50 fell from **2.752 to 2.014 s** and P99 from **28.777 to 26.957 s**. Owner counters confirm SSD → DRAM movement. All arms reported zero request errors.
+
+Input throughput and P50 improved in all four comparisons. Tail behavior varied: the original C64 750/750 P99 regression remains in the table. Its repeat improved P99 from **30.683 to 28.257 s**, but does not erase the original observation.
+
+[Cross-tier measurements, including the repeat](benchmark-results.json).
+
+### Case 2: cross-node prefetch after a session moves to another P
+
+Three exclusive nodes run **2P1D: two TP4 prefill Engines and one TP8 decode Engine, DP1**. Each P has a 512 GiB UMBP DRAM pool. Both owners share a Master, use strict-local PUT, direct pool GET, and remote recache; SSD is disabled.
+
+The case creates remote reuse through session migration:
+
+1. A session initially runs on P0. Strict-local PUT keeps its offloaded previous-turn KV in P0's owner, while shared metadata makes it readable from P1.
+2. An experimental `session_chbl` routing policy moves a later request to P1 when P0's waiting-uncached tokens exceed 4,096 and its load gap to the least-loaded P exceeds 5%, with a 20 s repin cooldown. Real HTTP load polls drive the decision; stale/missing state disables migration.
+3. **Share, prefetch off:** P1 obtains reusable KV from P0 through normal demand remote GET.
+4. **Share + prefetch:** after selecting P1, the Router submits to P1's owner. UMBP prepares available P0 KV in P1 DRAM through RDMA before normal LOAD needs it.
+
+This routing policy is an experiment overlay used identically in both arms, not a requirement of prefetch. Ordinary cross-node sharing remains enabled when prefetch is off. Both arms hash the same request tokens; only submission changes.
+
+AgentX replays from turn0 at concurrency 48, seed42, for a 1,200 s sending window with a 300 s ramp and no warmup. Model KV caches and both owner pools are cleared before each arm; the same image, Router binary, and model processes are reused.
+
+| Metric | Share, prefetch off | Share + prefetch | Change |
+| --- | ---: | ---: | ---: |
+| TTFT P50 | 0.563 s | 0.497 s | **−11.74%** |
+| TTFT P90 | 2.137 s | 2.125 s | −0.58% |
+| TTFT P99 | 5.735 s | 5.264 s | **−8.21%** |
+| Input throughput | 170,159.1 tok/s | 170,541.1 tok/s | +0.22% |
+| Output throughput | 1,710.5 tok/s | 1,711.9 tok/s | +0.09% |
+
+This pair shows an **additional TTFT benefit over ordinary sharing**, with essentially unchanged throughput. It retained 2,473/2,476 complete records, zero request errors, and 100% reported timing coverage. Each arm canceled three outstanding requests at the common end-of-phase limit. TTFT percentiles were independently recomputed; an invalid initial on attempt was excluded and replaced after correcting client configuration delivery.
+
+On accepted 1,873 prefetch tasks, completing 1,241,167 key entries across tasks. Outcomes were 54 READY, 1,102 PARTIAL, and 717 FAILED. A batch can include unavailable cold/new-turn keys; these counts describe tasks, not unique keys, useful-prefetch coverage, or inference errors.
+
+[Cross-node measurements and audit summary](benchmark-results.json).
+
+## Configuration and usage example
+
+The following uses the tested DeepSeek-V4 key layout, with documentation IPs replacing experiment addresses. P0/P1 Engine URLs map to their UMBP endpoints. For this shared component keyspace, a single rank entry per owner is sufficient.
+
+```json
+{
+  "worker_targets": {
+    "http://192.0.2.10:6100": [
+      {"rank": 0, "endpoint": "http://192.0.2.10:19041"}
+    ],
+    "http://192.0.2.20:6100": [
+      {"rank": 0, "endpoint": "http://192.0.2.20:19041"}
+    ]
+  },
+  "block_size": 256,
+  "is_bigram": false,
+  "key_templates": [
+    "-model_{hash}_pp0_deepseek_v4_c4",
+    "-model_{hash}_pp0_deepseek_v4_c4_indexer",
+    "-model_{hash}_pp0_deepseek_v4_c4_indexer_scale",
+    "-model_{hash}_pp0_deepseek_v4_c128"
+  ],
+  "submit_enabled": true
+}
+```
+
+Save this as `prefetch.json` and add **`--umbp-prefetch-config /path/prefetch.json`** to the existing Router launch command. Engines and UMBP owners must already be configured for external KV storage. The templates reflect the benchmark's `/model` mount and component layout; adjust them, the endpoints, tokenizer, and page/hash settings to match the deployed Engine. Rank-specific layouts need their actual rank entries.
+
+Send ordinary OpenAI-compatible requests through the Router, for example an existing long-prefix agentic turn:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary @agentic-turn.json
+```
+
+`agentic-turn.json` is a normal request with `model`, `messages`, and generation options. A reusable long prefix supplies complete cache blocks; new or missing keys may yield partial prefetch. No hint envelope is needed.
+
+Current defaults allow 4,096 complete prefix blocks, 4,096 keys per RPC, and 16 active batches/65,536 keys per physical endpoint. `timeout_ms` and `lease_ttl_ms` default to 5,000 ms; polling defaults to 2 ms. Optional `bytes_per_key`/`max_inflight_bytes` provide an estimated byte cap, not live DRAM capacity accounting.
+
+For a matched comparison, set **`"submit_enabled": false`** and restart the Router while retaining the same configuration, hashing, routing, sharing, and Engine LOAD settings. The file is loaded at startup. Omitting the CLI option disables the coordinator entirely. Disable any Engine-triggered prefetch when isolating the Router effect.
+
+For example, the C64 cross-tier run uses the experiment's AIPerf client and AgentX trace loader:
+
+```bash
+aiperf profile --scenario agentx \
+  --url http://127.0.0.1:8000 \
+  --model deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --tokenizer deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --tokenizer-trust-remote-code \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --concurrency 64 --benchmark-duration 3600 \
+  --output-artifact-dir ./artifacts/c64
+```
+
+The dataset is `semianalysisai/cc-traces-weka-062126`; the tested client/loader version is recorded in the retained run artifacts linked with the results. The cross-node replay uses the same trace family with concurrency 48, a 1,200 s window, a 300 s ramp, and the cold-reset/migration setup described above.
+
+## Correctness checks and measurement boundaries
+
+We also performed a [real RDMA functional check](benchmark-results.json): prefetch eight objects, observe READY, GET and verify complete bytes, then confirm that the subsequent local GET adds no RDMA. The transfer moved exactly **4,320,256 bytes**.
+
+For integration checks, use Router decisions/task logs to establish submission, backend counters to confirm the intended SSD/RDMA path, and byte checks to verify the copy. Measure request TTFT/throughput separately: **accepted or READY tasks alone do not prove inference benefit**. Per-request attribution of consumed prefetched KV remains a follow-up.
+
+The tables are observed matched comparisons, without a statistical-significance claim. The cross-node migration result is one valid pair. Nine additional cold-prefix burst pairs showed small, variable improvements; their pooled P99 increased 7.38%. A separate no-share control verified zero remote reads but used different physical nodes, so its larger latency gap is not used to quantify prefetch's benefit. These tests also do not isolate Router triggering versus Engine triggering. Total SSD/remote GET counters include demand and prefetch activity.
+
+## Proposed upstream scope
+
+Start with the existing opt-in async prefetch coordinator behind a small decision/submission/observation boundary. Preserve the configuration, physical-pool deduplication, bounded lifecycle, and normal LOAD behavior. This provides useful prefetch independently of a new routing policy or a broad plugin framework.
+
+Community feedback is requested on the integration point after final worker selection, the initial UMBP configuration/adapter boundary, and a minimal path for reporting actual consumption. In-band delivery can later reuse the versioned `kv_hints` transport in [#38891](https://github.com/sgl-project/sglang/pull/38891); Engine execution, per-request wait policy, other actions (Share/Pin/Demote/Retain), and other backend adapters require separate implementation and validation.
+
+## References and original design
+
+- [Source branch](https://github.com/wuyl1/sglang/tree/feat/router-umbp-prefetch) and [implemented coordinator](https://github.com/wuyl1/sglang/blob/d8f304f6b34e1f05a6c216e6b5b7952512b1b281/sgl-router/src/prefetch.rs).
+- [Benchmark measurements, validation summary, software provenance, and source artifact checksums](benchmark-results.json).
+
+<details>
+<summary>Original Hint architecture diagram: broader design and future extensions</summary>
+
+<img src="assets/hint-flow-horizontal.png" alt="Original Router Hint architecture, including async/in-band delivery and future Hint actions" width="700">
+
+The diagram is copied from the design document. Its in-band path and additional actions are future extensions; the main diagram above describes the implemented and benchmarked path.
+
+</details>
+
+The accompanying `benchmark-results.json` contains summarized measurements and source artifact checksums. Full per-request exports and detailed runtime audits remain in the local experiment archive.
