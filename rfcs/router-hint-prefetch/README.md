@@ -54,12 +54,14 @@ One TP4 prefill Engine and one TP8 decode Engine run on two nodes. AgentX replay
 2. **Prefetch off:** normal Engine LOAD reads the needed KV on demand.
 3. **Prefetch on:** the Router submits prefix keys before forwarding; UMBP moves available SSD KV into DRAM so LOAD can reuse it.
 
-| Concurrency; DRAM / SSD | Input throughput off → on (tok/s) | Change | TTFT P50 change | P90 change | P99 change |
+TTFT columns show prefetch off → on (percentage change), in seconds.
+
+| Concurrency; DRAM / SSD | Input throughput off → on (tok/s) | Change | TTFT P50 (s) | P90 (s) | P99 (s) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| C64; 750 / 750 GB | 329,424.38 → 332,480.18 | +0.93% | −8.42% | −13.48% | **+10.10%** |
-| C64; 750 / 750 GB, repeat | 327,489.21 → 333,043.48 | +1.70% | −21.47% | +1.66% | −7.90% |
-| C64; 500 / 1,000 GB | 325,766.77 → 333,658.47 | **+2.42%** | **−26.83%** | −11.90% | −6.33% |
-| C192; 750 / 750 GB | 777,802.65 → 789,870.47 | +1.55% | −0.92% | −1.06% | −1.96% |
+| C64; 750 / 750 GB | 329,424.38 → 332,480.18 | +0.93% | 2.363 → 2.164 (−8.42%) | 10.228 → 8.849 (−13.48%) | 27.697 → 30.493 (**+10.10%**) |
+| C64; 750 / 750 GB, repeat | 327,489.21 → 333,043.48 | +1.70% | 2.525 → 1.983 (−21.47%) | 9.822 → 9.984 (+1.66%) | 30.683 → 28.257 (−7.90%) |
+| C64; 500 / 1,000 GB | 325,766.77 → 333,658.47 | **+2.42%** | 2.752 → 2.014 (**−26.83%**) | 10.322 → 9.094 (−11.90%) | 28.777 → 26.957 (−6.33%) |
+| C192; 750 / 750 GB | 777,802.65 → 789,870.47 | +1.55% | 4.090 → 4.053 (−0.92%) | 11.422 → 11.302 (−1.06%) | 39.643 → 38.865 (−1.96%) |
 
 For C64 500/1,000 GB, TTFT P50 fell from **2.752 to 2.014 s** and P99 from **28.777 to 26.957 s**. Owner counters confirm SSD → DRAM movement. All arms reported zero request errors.
 
