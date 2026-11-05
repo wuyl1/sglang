@@ -4,7 +4,7 @@ Status: draft for author review · 2026-11-05
 
 ## Summary
 
-We propose a **Hint module in SGLang Router for extensible KV cache operations**. It uses request context, the selected worker, and available cache state to decide which hints to issue and observe their outcomes. Prefetch is the first implemented operation; Share, Pin, Demote, and Retain are intended extensions. Backend adapters provide an extension point for cache systems, starting with UMBP and allowing future integrations such as Mooncake.
+We propose a **Hint module in SGLang Router for extensible KV cache operations**. It uses request context, the selected worker, and available cache state to decide which hints to issue and observe their outcomes. The operation taxonomy follows the community proposal [#27574](https://github.com/sgl-project/sglang/issues/27574): Prefetch, Share, Pin, Demote, and Retain. Compatibility with these community-proposed operations is a design goal; Prefetch is our first implementation, with the remaining operations added according to backend capabilities. Backend adapters provide an extension point for cache systems, starting with UMBP and allowing future integrations such as Mooncake.
 
 Our initial implementation is **async KV prefetch with UMBP**. After the routing policy selects a worker, the Router submits reusable prefix keys to that worker's UMBP backend before forwarding the request. UMBP prepares the KV in local DRAM from SSD or another node while the Engine proceeds through its normal request queue and LOAD path.
 
@@ -21,7 +21,7 @@ Demand LOAD may need KV that has been offloaded to SSD or remains on a previous 
 
 <img src="assets/hint-flow-horizontal.en.png" alt="Router Hint architecture: implemented async UMBP prefetch and planned extensions" width="900">
 
-**Scope of the diagram:** the direct async UMBP path is implemented and benchmarked for SSD → DRAM and remote-node → local DRAM. The sync/in-band path, Share/Pin/Demote/Retain actions, Mooncake adapter, and consumed-KV attribution are planned extensions.
+**Scope of the diagram:** the direct async UMBP path is implemented and benchmarked for SSD → DRAM and remote-node → local DRAM. The sync/in-band path, execution of the community-proposed Share/Pin/Demote/Retain actions, Mooncake adapter, and consumed-KV attribution remain follow-up work.
 
 **The Router waits for submission resolution, not READY.** Transfer and status polling continue in background tasks. Rejection or an uncertain submission leaves normal Engine LOAD available. Backend-local READY means complete KV is available in UMBP DRAM; Engine LOAD still restores it into GPU memory.
 
@@ -169,9 +169,9 @@ The tables report observed results, without a statistical-significance claim. Th
 
 ## Proposed upstream scope
 
-Introduce the Hint module around the existing opt-in async prefetch coordinator, with a small operation/adapter boundary and UMBP as its initial backend. Preserve the configuration, physical-pool deduplication, bounded lifecycle, and normal LOAD behavior. Add other actions and backends incrementally as use cases and backend capabilities justify them.
+Introduce the Hint module around the existing opt-in async prefetch coordinator, with a small operation/adapter boundary and UMBP as its initial backend. Preserve the configuration, physical-pool deduplication, bounded lifecycle, and normal LOAD behavior. Implement further community-proposed actions and backend adapters incrementally as use cases and backend capabilities justify them.
 
-Community feedback is requested on the integration point after final worker selection, the operation/backend adapter boundary with UMBP as the first implementation, and a minimal path for reporting actual consumption. In-band delivery can later reuse the versioned `kv_hints` transport in [#38891](https://github.com/sgl-project/sglang/pull/38891); Engine execution, per-request wait policy, other actions (Share/Pin/Demote/Retain), and other backend adapters require separate implementation and validation.
+Community feedback is requested on the integration point after final worker selection, the operation/backend adapter boundary with UMBP as the first implementation, and a minimal path for reporting actual consumption. For in-band delivery, we aim to reuse the versioned `kv_hints` envelope proposed in [#36224](https://github.com/sgl-project/sglang/issues/36224), with transport provided by merged PR [#38891](https://github.com/sgl-project/sglang/pull/38891). That PR does not define or execute action types. Engine execution, per-request wait policy, further community-proposed actions, and other backend adapters require separate implementation and validation.
 
 ## References
 
