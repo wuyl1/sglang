@@ -13,41 +13,13 @@ The implementation is available in [wuyl1/sglang:feat/router-umbp-prefetch](http
 
 This RFC focuses on the existing functionality, its integration boundary, and these test cases. Broader Hint actions are a follow-up.
 
-## Implemented request flow
+## Request flow and Hint boundary
 
 Demand LOAD may need KV that has been offloaded to SSD or remains on a previous session worker. Starting the read in the Router creates an opportunity to overlap I/O with request delivery and Engine queueing. Prefetch begins after the request arrives and its destination is known.
 
-```mermaid
-flowchart TB
-    subgraph Router["SGLang Router"]
-        R["Receive and tokenize request"] --> S["Routing policy selects final worker"]
-        subgraph Hint["Hint module: implemented async prefetch"]
-            K["Hash bounded complete prefix blocks"]
-            D{"Enabled, eligible, and target mapped?"}
-            B["Expand/deduplicate keys; reuse in-flight tasks; apply pool budget"]
-            A["SubmitPrefetch to target UMBP; await bounded submission result"]
-            K --> D
-            D -->|yes| B --> A
-        end
-        S --> K
-        D -->|skip| F["Forward request"]
-        B -->|budget skip| F
-        A --> F
-    end
-    subgraph Backend["UMBP"]
-        T["Async transfer: SSD or remote node to target local DRAM"]
-        V["GetPrefetchStatus: READY / PARTIAL / FAILED / EXPIRED"]
-        T --> V
-    end
-    subgraph Engine["Selected Engine"]
-        Q["Receive request and queue"] --> L["Normal LOAD to GPU and inference"]
-        L --> O["Return output"]
-    end
-    A -.-> T
-    A -.->|background polling| V
-    F --> Q
-    T -.->|available KV reused by LOAD| L
-```
+<img src="assets/hint-flow-horizontal.en.png" alt="Router Hint architecture: implemented async UMBP prefetch and planned extensions" width="900">
+
+**Scope of the diagram:** the direct async UMBP path is implemented and benchmarked for SSD → DRAM and remote-node → local DRAM. The sync/in-band path, Share/Pin/Demote/Retain actions, Mooncake adapter, and consumed-KV attribution are planned extensions.
 
 **The Router waits for submission resolution, not READY.** Transfer and status polling continue in background tasks. Rejection or an uncertain submission leaves normal Engine LOAD available. Backend-local READY means complete KV is available in UMBP DRAM; Engine LOAD still restores it into GPU memory.
 
@@ -191,18 +163,9 @@ Start with the existing opt-in async prefetch coordinator behind a small decisio
 
 Community feedback is requested on the integration point after final worker selection, the initial UMBP configuration/adapter boundary, and a minimal path for reporting actual consumption. In-band delivery can later reuse the versioned `kv_hints` transport in [#38891](https://github.com/sgl-project/sglang/pull/38891); Engine execution, per-request wait policy, other actions (Share/Pin/Demote/Retain), and other backend adapters require separate implementation and validation.
 
-## References and original design
+## References
 
 - [Source branch](https://github.com/wuyl1/sglang/tree/feat/router-umbp-prefetch) and [implemented coordinator](https://github.com/wuyl1/sglang/blob/d8f304f6b34e1f05a6c216e6b5b7952512b1b281/sgl-router/src/prefetch.rs).
 - [Benchmark measurements, validation summary, software provenance, and source artifact checksums](benchmark-results.json).
-
-<details>
-<summary>Original Hint architecture diagram: broader design and future extensions</summary>
-
-<img src="assets/hint-flow-horizontal.png" alt="Original Router Hint architecture, including async/in-band delivery and future Hint actions" width="700">
-
-The diagram is copied from the design document. Its in-band path and additional actions are future extensions; the main diagram above describes the implemented and benchmarked path.
-
-</details>
 
 The accompanying `benchmark-results.json` contains summarized measurements and source artifact checksums. Full per-request exports and detailed runtime audits remain in the local experiment archive.
