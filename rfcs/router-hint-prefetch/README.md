@@ -1,17 +1,19 @@
-# [RFC] Router Hint Module: Async KV Prefetch with UMBP
+# [RFC] Router Hint Module for KV Cache Operations
 
 Status: draft for author review · 2026-11-05
 
 ## Summary
 
-We propose upstreaming the **implemented async KV prefetch path** as the first capability of a small Hint module in SGLang Router. After the routing policy selects a worker, the Router submits reusable prefix keys to that worker's UMBP backend before forwarding the request. UMBP prepares the KV in local DRAM from SSD or another node while the Engine proceeds through its normal request queue and LOAD path.
+We propose a **Hint module in SGLang Router for extensible KV cache operations**. It uses request context, the selected worker, and available cache state to decide which hints to issue and observe their outcomes. Prefetch is the first implemented operation; Share, Pin, Demote, and Retain are intended extensions. Backend adapters provide an extension point for cache systems, starting with UMBP and allowing future integrations such as Mooncake.
+
+Our initial implementation is **async KV prefetch with UMBP**. After the routing policy selects a worker, the Router submits reusable prefix keys to that worker's UMBP backend before forwarding the request. UMBP prepares the KV in local DRAM from SSD or another node while the Engine proceeds through its normal request queue and LOAD path.
 
 The implementation is available in [wuyl1/sglang:feat/router-umbp-prefetch](https://github.com/wuyl1/sglang/tree/feat/router-umbp-prefetch), at [commit d8f304f6](https://github.com/wuyl1/sglang/commit/d8f304f6b34e1f05a6c216e6b5b7952512b1b281). We have exercised both storage paths with DeepSeek-V4-Pro-0813 on AMD MI355X:
 
 - **Cross-tier SSD → DRAM:** four matched comparisons observed input-throughput gains of **0.93%–2.42%**. The C64 500/1,000 GB pair reduced TTFT P50 by **26.83%** and P99 by **6.33%**.
 - **Cross-node session migration:** compared with ordinary sharing with prefetch disabled, Router prefetch reduced TTFT P50 by **11.74%** and P99 by **8.21%**, with input throughput essentially unchanged (**+0.22%**).
 
-This RFC focuses on the existing functionality, its integration boundary, and these test cases. Broader Hint actions are a follow-up.
+The measurements below validate the initial UMBP Prefetch path. Other operations and backends require their own implementation and validation.
 
 ## Request flow and Hint boundary
 
@@ -24,6 +26,8 @@ Demand LOAD may need KV that has been offloaded to SSD or remains on a previous 
 **The Router waits for submission resolution, not READY.** Transfer and status polling continue in background tasks. Rejection or an uncertain submission leaves normal Engine LOAD available. Backend-local READY means complete KV is available in UMBP DRAM; Engine LOAD still restores it into GPU memory.
 
 The Hint boundary owns decisions, submission, and observation for the selected destination. Routing policies retain worker selection and forwarding. In PD, current-prompt prefetch targets P; the normal P → D GPU KV transfer is a separate path.
+
+**Proposed extension boundary:** operations express cache intent; backend adapters map prefix identity and destination to backend keys/endpoints, expose supported actions, and translate submission/status APIs. Decisions, budgets, task lifecycle, and observation stay in the Hint module. Each backend supports the actions it can execute; unsupported hints are recorded and normal generation continues. The current implementation calls UMBP directly; the shared adapter boundary and Mooncake integration are proposed work.
 
 ### Capabilities already present
 
@@ -159,9 +163,9 @@ The tables are observed matched comparisons, without a statistical-significance 
 
 ## Proposed upstream scope
 
-Start with the existing opt-in async prefetch coordinator behind a small decision/submission/observation boundary. Preserve the configuration, physical-pool deduplication, bounded lifecycle, and normal LOAD behavior. This provides useful prefetch independently of a new routing policy or a broad plugin framework.
+Introduce the Hint module around the existing opt-in async prefetch coordinator, with a small operation/adapter boundary and UMBP as its initial backend. Preserve the configuration, physical-pool deduplication, bounded lifecycle, and normal LOAD behavior. Add other actions and backends incrementally as use cases and backend capabilities justify them.
 
-Community feedback is requested on the integration point after final worker selection, the initial UMBP configuration/adapter boundary, and a minimal path for reporting actual consumption. In-band delivery can later reuse the versioned `kv_hints` transport in [#38891](https://github.com/sgl-project/sglang/pull/38891); Engine execution, per-request wait policy, other actions (Share/Pin/Demote/Retain), and other backend adapters require separate implementation and validation.
+Community feedback is requested on the integration point after final worker selection, the operation/backend adapter boundary with UMBP as the first implementation, and a minimal path for reporting actual consumption. In-band delivery can later reuse the versioned `kv_hints` transport in [#38891](https://github.com/sgl-project/sglang/pull/38891); Engine execution, per-request wait policy, other actions (Share/Pin/Demote/Retain), and other backend adapters require separate implementation and validation.
 
 ## References
 
