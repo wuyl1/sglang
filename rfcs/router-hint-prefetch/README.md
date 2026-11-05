@@ -78,15 +78,15 @@ The case creates remote reuse through session migration:
 1. A session initially runs on P0. Strict-local PUT keeps its offloaded previous-turn KV in P0's owner, while shared metadata makes it readable from P1.
 2. An experimental `session_chbl` routing policy moves a later request to P1 when P0's waiting-uncached tokens exceed 4,096 and its load gap to the least-loaded P exceeds 5%, with a 20 s repin cooldown. Real HTTP load polls drive the decision; stale/missing state disables migration.
 3. **Share:** P1 obtains reusable KV from P0 through normal demand remote GET during Engine LOAD.
-4. **Prefetch:** after selecting P1, the Router submits to P1's owner before forwarding. UMBP prepares available P0 KV in P1 DRAM through RDMA so normal LOAD can reuse it.
+4. **Share + Prefetch:** after selecting P1, the Router submits to P1's owner before forwarding. UMBP prepares available P0 KV in P1 DRAM through RDMA so normal LOAD can reuse it.
 
-This routing policy is an experiment overlay used identically in both arms, not a requirement of prefetch. **Share and Prefetch both retain cross-node sharing** and hash the same request tokens; only Prefetch enables Router prefetch submission before forwarding.
+This routing policy is an experiment overlay used identically in both arms, not a requirement of prefetch. **Share and Share + Prefetch both retain cross-node sharing** and hash the same request tokens; Share + Prefetch additionally enables Router prefetch submission before forwarding.
 
 AgentX replays from turn0 at concurrency 48, seed42, for a 1,200 s sending window with a 300 s ramp and no warmup. Model KV caches and both owner pools are cleared before each arm; the same image, Router binary, and model processes are reused.
 
-The **no-share** arm preserves local caching, session migration, and normal P → D GPU KV transfer. Each P owner uses an independent Master, with Router and Engine prefetch disabled; audits confirmed zero remote cache-read bytes.
+The **No share** arm preserves local caching, session migration, and normal P → D GPU KV transfer. Each P owner uses an independent Master, with Router and Engine prefetch disabled; audits confirmed zero remote cache-read bytes.
 
-| Metric | No share | Share | Prefetch | Prefetch vs. Share |
+| Metric | No share | Share | Share + Prefetch | Prefetch gain |
 | --- | ---: | ---: | ---: | ---: |
 | TTFT P50 | 1.024 s | 0.563 s | 0.497 s | **−11.74%** |
 | TTFT P90 | 5.530 s | 2.137 s | 2.125 s | −0.58% |
@@ -94,7 +94,7 @@ The **no-share** arm preserves local caching, session migration, and normal P �
 | Input throughput | 165,340.9 tok/s | 170,159.1 tok/s | 170,541.1 tok/s | +0.22% |
 | Output throughput | 1,659.1 tok/s | 1,710.5 tok/s | 1,711.9 tok/s | +0.09% |
 
-The three arms show the observed trend; no-share ran on a separate node allocation. The last column compares the matched sharing arms.
+The three arms show the observed trend; No share ran on a separate node allocation. The last column gives the percentage change of Share + Prefetch relative to Share.
 
 The matched sharing pair shows an **additional TTFT benefit over ordinary sharing**, with essentially unchanged throughput. It retained 2,473/2,476 complete records, zero request errors, and 100% reported timing coverage. Each arm canceled three outstanding requests at the common end-of-phase limit. TTFT percentiles were independently recomputed; an invalid initial on attempt was excluded and replaced after correcting client configuration delivery.
 
